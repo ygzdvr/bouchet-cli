@@ -1,76 +1,49 @@
 # bouchet-cli
 
-CLI tools and aliases for Yale HPC (Bouchet, Grace, McCleary).
+Little commands for Yale's Bouchet cluster.
 
-| Alias | What it does |
-|---|---|
-| `g` | `git` |
-| `cl` | Claude Code, skip permissions |
-| `cx` | Codex CLI, `--yolo` |
-| `clr` | Claude Code, skip permissions, resume last session |
-| `cxr` | Codex CLI, `--yolo`, resume last session |
-| `lm` / `limits` | Claude and Codex usage bars (session + week) |
-| `status` / `st` | Slurm session, idle GPUs, your jobs, monthly allocation, storage |
+One paste. Then you type short words and get pretty boxes.
 
-No extra Python packages. Needs `python3` (already on YCRC clusters).
-
-## Install (one line)
+## Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/ygzdvr/bouchet-cli/main/install.sh | bash
 source ~/.bashrc
 ```
 
-Then:
+Needs `python3`. Already on the cluster.
 
-```bash
-lm          # or: limits
-status      # or: st
-cl          # Claude
-cx          # Codex
-```
+## `lm` — how much AI is left?
 
-`~/.local/bin` is already on `PATH` for most Yale accounts. If `lm` or `status` is not found:
+Same command: `limits`.
 
-```bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
-source ~/.bashrc
-```
+<img src="docs/lm.png" alt="lm showing Claude and Codex usage bars" width="620">
 
-### From a clone
+Green = lots left. Yellow = you're into the week.
 
-```bash
-git clone https://github.com/ygzdvr/bouchet-cli.git
-cd bouchet-cli
-./install.sh
-```
+## `status` — what's going on?
 
-## `lm` / `limits` — AI usage
+Same command: `st`.
 
-Requires at least one of these on `PATH`:
+<img src="docs/status.png" alt="status showing jobs, GPUs, hours, and disk" width="900">
 
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) (`claude`)
-- [Codex CLI](https://github.com/openai/codex) (`codex`)
+Idle GPUs. Your job. This month. Disk. Fresh every time.
 
-Logged-out or missing tools are skipped. Token counts and email are never printed.
+## `cl` `cx` `clr` `cxr` `g` — skip the typing
 
-## `status` / `st` — cluster dashboard
+<img src="docs/aliases.png" alt="aliases for Claude, Codex, and git" width="520">
 
-Meant for **YCRC Slurm** (Bouchet / Grace / McCleary). Needs:
+`cl` opens Claude. No permission nags.  
+`cx` opens Codex. Just go.  
+`clr` / `cxr` pick up the last chat.  
+`g` is git.
 
-- `squeue`, `sinfo`, `scontrol`, `sshare`, `sacct` (standard Slurm)
-- `getquota` for STORAGE (YCRC module environment; section is omitted if missing)
-- `$SCRATCH` or `~/scratch_*/$USER` for scratch usage
-
-GPU rows cover the usual Yale types (H100, H200, B200, RTX PRO 6000, L40S, A40). Partitions shown: `day`, `devel`, `week`, `mpi`.
-
-## Uninstall
+## Bye
 
 ```bash
 rm -f ~/.local/bin/lm ~/.local/bin/status
-# then delete the "# --- bouchet-cli aliases ---" block from ~/.aliases.sh or ~/.bashrc
 ```
 
-## License
+Then delete the `bouchet-cli aliases` block from `~/.aliases.sh` (or `~/.bashrc`).
 
-MIT
+MIT · [ygzdvr/bouchet-cli](https://github.com/ygzdvr/bouchet-cli)
