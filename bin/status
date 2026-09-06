@@ -857,34 +857,159 @@ def month_stats(user):
 
 
 def fairshare(user, account):
+    snap = share_snapshot(user, account)
+    if not snap:
+        return None
+    return snap.get("user_fs"), snap.get("account_fs")
+
+
+def share_snapshot(user, account):
+    """Fairshare plus any GrpTRESMins quota (hours left) from one sshare call."""
+    empty = {"user_fs": None, "account_fs": None, "limit": {}, "used": {}}
     if not account:
-        return None
-    raw = run(["sshare", "-A", account, "-u", user, "--parsable2"])
+        return empty
+    raw = run([
+        "sshare", "-A", account, "-u", user, "--parsable2",
+        "-o", "Account,User,FairShare,GrpTRESMins,GrpTRESRaw,TRESRunMins",
+    ])
     if not raw:
-        return None
+        return empty
     lines = [ln for ln in raw.splitlines() if ln.strip() and not slurm_error_line(ln)]
     if not lines:
-        return None
+        return empty
     header = [h.strip() for h in lines[0].split("|")]
-    try:
-        i_acct, i_user, i_fs = header.index("Account"), header.index("User"), header.index("FairShare")
-    except ValueError:
-        i_acct, i_user, i_fs = 0, 1, len(header) - 1
+
+    def col(*names):
+        for name in names:
+            if name in header:
+                return header.index(name)
+        return None
+
+    i_acct = col("Account")
+    i_user = col("User")
+    i_fs = col("FairShare")
+    i_lim = col("GrpTRESMins")
+    i_used = col("GrpTRESRaw")
+    if i_acct is None or i_user is None:
+        return empty
     user_fs = account_fs = None
+    user_lim, user_used, acct_lim, acct_used = {}, {}, {}, {}
     for row in lines[1:]:
         parts = row.split("|")
-        if max(i_acct, i_user, i_fs) >= len(parts):
+        need = max(i for i in (i_acct, i_user, i_fs, i_lim, i_used) if i is not None)
+        if need >= len(parts):
             continue
-        acct, uname, fs = parts[i_acct].strip(), parts[i_user].strip(), parts[i_fs].strip()
-        try:
-            val = float(fs) if fs else None
-        except ValueError:
-            val = None
+        acct, uname = parts[i_acct].strip(), parts[i_user].strip()
+        if i_fs is not None and i_fs < len(parts):
+            try:
+                val = float(parts[i_fs].strip()) if parts[i_fs].strip() else None
+            except ValueError:
+                val = None
+            if uname == user:
+                user_fs = val
+            elif uname == "" and acct == account:
+                account_fs = val
+        lim = parse_tres(parts[i_lim]) if i_lim is not None and i_lim < len(parts) else {}
+        used = parse_tres(parts[i_used]) if i_used is not None and i_used < len(parts) else {}
         if uname == user:
-            user_fs = val
+            user_lim, user_used = lim, used
         elif uname == "" and acct == account:
-            account_fs = val
-    return user_fs, account_fs
+            acct_lim, acct_used = lim, used
+    limit = acct_lim if any(number(str(v)) > 0 for v in acct_lim.values()) else user_lim
+    used = acct_used if limit is acct_lim else user_used
+    return {
+        "user_fs": user_fs,
+        "account_fs": account_fs,
+        "limit": limit or {},
+        "used": used or {},
+    }
+
+
+def quota_hours_left(limit, used):
+    """Hours remaining from GrpTRESMins, if the account actually has a cap."""
+    cpu_left = None
+    gpu_left = {}
+    cpu_lim = number(str(limit.get("cpu") or "0"))
+    if cpu_lim > 0:
+        cpu_left = max(0.0, (cpu_lim - number(str(used.get("cpu") or "0"))) / 60.0)
+    for key, raw in (limit or {}).items():
+        if not key.startswith("gres/gpu"):
+            continue
+        lim = number(str(raw))
+        if lim <= 0:
+            continue
+        kind = key.split(":", 1)[1] if ":" in key else "gpu"
+        gpu_left[kind] = max(0.0, (lim - number(str(used.get(key) or "0"))) / 60.0)
+    return cpu_left, gpu_left
+
+
+def job_hours_left(job):
+    left = parse_slurm_time(job.get("left"))
+    if left is not None:
+        return max(0.0, left.total_seconds() / 3600.0)
+    end_dt = parse_slurm_dt(job.get("end"))
+    if end_dt:
+        return max(0.0, (end_dt - datetime.now()).total_seconds() / 3600.0)
+    start_dt = parse_slurm_dt(job.get("start"))
+    limit = parse_slurm_time(job.get("limit"))
+    if start_dt and limit is not None:
+        return max(0.0, (start_dt + limit - datetime.now()).total_seconds() / 3600.0)
+    used = parse_slurm_time(job.get("elapsed"))
+    if used is not None and limit is not None:
+        return max(0.0, (limit - used).total_seconds() / 3600.0)
+    return 0.0
+
+
+def leftover_on_jobs(jobs):
+    """Hours still ticking on RUNNING jobs: CPU-hours by partition, GPU-hours by type."""
+    cpu = defaultdict(float)
+    gpu = defaultdict(float)
+    for job in jobs or []:
+        if (job.get("state") or "").upper() != "RUNNING":
+            continue
+        hours = job_hours_left(job)
+        if hours < 0.01:
+            continue
+        ncpus = number(str(job.get("cpu") or "0"))
+        part = job.get("partition") or "unknown"
+        cpu[part] += hours * ncpus
+        tres = parse_tres(job.get("tres") or "")
+        typed = False
+        for key, value in tres.items():
+            if key.startswith("gres/gpu:"):
+                gpu[key.split(":", 1)[1]] += hours * number(value)
+                typed = True
+        if not typed:
+            ng = number(str(tres.get("gres/gpu") or "0"))
+            if not ng:
+                gpu_field = (job.get("gpu") or "").lower()
+                ng = number(gpu_field)
+                for kind in ("h100", "h200", "b200", "l40s", "a40", "a5000",
+                             "rtx_pro_6000_blackwell", "rtx_5000_ada"):
+                    if kind in gpu_field.replace("-", "_"):
+                        gpu[kind] += hours * max(ng, 1.0)
+                        typed = True
+                        break
+            if not typed and ng:
+                gpu["gpu"] += hours * ng
+    return cpu, gpu
+
+
+def fmt_hours_left(hours, width=7, quota=False):
+    if hours is None:
+        return dcell("—", width)
+    if hours < 0.05:
+        return dcell("0", width, RE if quota else DIM)
+    if hours < 10:
+        text = f"{hours:.1f}h"
+    else:
+        text = f"{hours:.0f}h"
+    color = GR
+    if quota and hours < 2:
+        color = RE
+    elif quota and hours < 12:
+        color = YE
+    return dcell(text, width, color)
 
 
 def load_quota(user):
@@ -1102,7 +1227,7 @@ def render_job(job, user, here):
             brow(dcell(name, 12), used, dcell(detail, 48))
 
 
-def render_month(stats):
+def render_month(stats, jobs=None, share=None):
     now = datetime.now()
     states = stats["states"]
     done = states.get("COMPLETED", 0)
@@ -1121,10 +1246,25 @@ def render_month(stats):
         parts.append(f"{fail} failed")
     if cancelled:
         parts.append(f"{cancelled} cancelled")
-    section("MONTH", now.strftime("%b %Y") + " · " + (" · ".join(parts) if stats["jobs"] else "no jobs"))
+    job_cpu_left, job_gpu_left = leftover_on_jobs(jobs)
+    quota_cpu, quota_gpu = None, {}
+    if share:
+        quota_cpu, quota_gpu = quota_hours_left(share.get("limit") or {}, share.get("used") or {})
+    has_quota = quota_cpu is not None or bool(quota_gpu)
+    left_note = "left in quota" if has_quota else ("left on jobs" if (job_cpu_left or job_gpu_left) else "")
+    meta = now.strftime("%b %Y") + " · " + (" · ".join(parts) if stats["jobs"] else "no jobs")
+    if left_note:
+        meta += " · " + left_note
+    section("MONTH", meta)
     if not stats.get("ok", True):
-        brow(hcell("CPU", 12), hcell("HOURS", 7), hcell("GPU", 12), hcell("HOURS", 7))
-        brow(dcell("—", 12), dcell("sacct down", 7), dcell("", 12), dcell("", 7))
+        brow(
+            hcell("CPU", 12), hcell("USED", 7), hcell("LEFT", 7),
+            hcell("GPU", 12), hcell("USED", 7), hcell("LEFT", 7),
+        )
+        brow(
+            dcell("—", 12), dcell("sacct down", 7), dcell("", 7),
+            dcell("", 12), dcell("", 7), dcell("", 7),
+        )
         return
     cpu_rows = [
         (name, hours)
@@ -1132,22 +1272,70 @@ def render_month(stats):
         if hours >= 0.05
     ]
     gpu_rows = [
-        (pretty_gpu(name), hours)
+        (name, hours)
         for name, hours in sorted(stats["gpu"].items(), key=lambda kv: -kv[1])
         if hours >= 0.05
     ]
     gpu_total = sum(stats["gpu"].values())
-    brow(hcell("CPU", 12), hcell("HOURS", 7), hcell("GPU", 12), hcell("HOURS", 7))
+    # include leftover-only rows so "12h left" still shows with little month usage
+    cpu_names = [n for n, _ in cpu_rows]
+    for name in job_cpu_left:
+        if name not in cpu_names and job_cpu_left[name] >= 0.05:
+            cpu_rows.append((name, 0.0))
+            cpu_names.append(name)
+    gpu_names = [n for n, _ in gpu_rows]
+    for name in list(job_gpu_left) + list(quota_gpu):
+        if name not in gpu_names and (job_gpu_left.get(name, 0) >= 0.05 or quota_gpu.get(name, 0) >= 0.05):
+            gpu_rows.append((name, 0.0))
+            gpu_names.append(name)
+
+    def cpu_left(name):
+        if name == "total":
+            if quota_cpu is not None:
+                return quota_cpu, True
+            total = sum(job_cpu_left.values())
+            return (total if total >= 0.05 else None), False
+        hours = job_cpu_left.get(name)
+        if hours is None or hours < 0.05:
+            return None, False
+        return hours, False
+
+    def gpu_left(name):
+        if name == "total":
+            if quota_gpu:
+                return sum(quota_gpu.values()), True
+            total = sum(job_gpu_left.values())
+            return (total if total >= 0.05 else None), False
+        if name in quota_gpu:
+            return quota_gpu[name], True
+        hours = job_gpu_left.get(name)
+        if hours is None or hours < 0.05:
+            return None, False
+        return hours, False
+
     brow(
-        dcell("total", 12), dcell(f"{stats['cpu']:.1f}h", 7),
+        hcell("CPU", 12), hcell("USED", 7), hcell("LEFT", 7),
+        hcell("GPU", 12), hcell("USED", 7), hcell("LEFT", 7),
+    )
+    cpu_l, cpu_q = cpu_left("total")
+    gpu_l, gpu_q = gpu_left("total")
+    brow(
+        dcell("total", 12), dcell(f"{stats['cpu']:.1f}h", 7), fmt_hours_left(cpu_l, 7, cpu_q),
         dcell("total", 12), dcell(f"{gpu_total:.1f}h" if gpu_total else "none", 7),
+        fmt_hours_left(gpu_l, 7, gpu_q),
     )
     for i in range(max(len(cpu_rows), len(gpu_rows))):
         ln, lh = cpu_rows[i] if i < len(cpu_rows) else ("", "")
         rn, rh = gpu_rows[i] if i < len(gpu_rows) else ("", "")
+        cl, cq = cpu_left(ln) if ln else (None, False)
+        gl, gq = gpu_left(rn) if rn else (None, False)
         brow(
-            dcell(ln, 12), dcell(f"{lh:.1f}" if lh != "" else "", 7),
-            dcell(rn, 12), dcell(f"{rh:.1f}" if rh != "" else "", 7),
+            dcell(ln or " ", 12),
+            dcell(f"{lh:.1f}" if lh != "" else " ", 7),
+            fmt_hours_left(cl, 7, cq) if ln else dcell(" ", 7),
+            dcell(pretty_gpu(rn) if rn else " ", 12),
+            dcell(f"{rh:.1f}" if rh != "" else " ", 7),
+            fmt_hours_left(gl, 7, gq) if rn else dcell(" ", 7),
         )
 
 
@@ -1311,8 +1499,10 @@ def main():
     if quota.get("data") and not cluster:
         cluster = quota["data"].get("cluster")
     try:
-        fs = fairshare(user, account) if account else None
+        snap = share_snapshot(user, account) if account else None
+        fs = (snap.get("user_fs"), snap.get("account_fs")) if snap else None
     except Exception:
+        snap = None
         fs = None
 
     model = None
@@ -1331,14 +1521,14 @@ def main():
         or ((qos or "").split(",")[0].strip() if qos else None)
     )
     section("SESSION")
-    share = f"{fs[0]:.2f}" if fs and fs[0] is not None else ""
+    share_txt = f"{fs[0]:.2f}" if fs and fs[0] is not None else ""
     brow(
         hcell("USER", 12), hcell("ACCOUNT", 10), hcell("QOS", 12),
         hcell("CLUSTER", 8), hcell("HOST", 12), hcell("CPU", 14), hcell("SHARE", 6),
     )
     brow(
         dcell(user, 12), dcell(account, 10), dcell(session_qos, 12),
-        dcell(cluster, 8), dcell(here, 12), dcell(model, 14), dcell(share, 6),
+        dcell(cluster, 8), dcell(here, 12), dcell(model, 14), dcell(share_txt, 6),
     )
 
     line()
@@ -1362,7 +1552,7 @@ def main():
             render_job(job, user, here)
 
     line()
-    render_month(stats)
+    render_month(stats, jobs=jobs, share=snap)
 
     line()
     render_storage(

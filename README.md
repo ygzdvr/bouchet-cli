@@ -29,7 +29,7 @@ Same command: `st`.
 
 <img src="docs/status.png" alt="status showing jobs, GPUs, hours, and disk" width="900">
 
-Idle GPUs. Your job. This month. Disk. Fresh every time.
+Idle GPUs. Your job. This month’s hours — used and left. Disk. Fresh every time.
 
 ## `cl` `cx` `clr` `cxr` `g` = just skip the typing
 
