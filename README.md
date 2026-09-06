@@ -2,9 +2,9 @@
 
 Two terminal dashboards for Yale HPC (Bouchet, Grace, McCleary) and anywhere else Slurm + Claude/Codex live.
 
-| Command | What it shows |
+| Alias | What it shows |
 |---|---|
-| `lm` | Claude and Codex usage bars (session + week). Live every run. |
+| `lm` / `limits` | Claude and Codex usage bars (session + week). Live every run. |
 | `status` / `st` | Slurm session, idle GPUs, your jobs, monthly allocation, storage, most recent jobs. |
 
 No extra Python packages. Needs `python3` (already on YCRC clusters).
@@ -15,11 +15,12 @@ No extra Python packages. Needs `python3` (already on YCRC clusters).
 curl -fsSL https://raw.githubusercontent.com/ygzdvr/lm-status/main/install.sh | bash
 ```
 
-Then:
+Then reload once and use any of the four aliases:
 
 ```bash
-lm
-status   # or: st
+source ~/.bashrc
+lm          # or: limits
+status      # or: st
 ```
 
 `~/.local/bin` is already on `PATH` for most Yale accounts. If `lm` or `status` is not found:
@@ -59,7 +60,8 @@ GPU rows cover the usual Yale types (H100, H200, B200, RTX PRO 6000, L40S, A40).
 ## Uninstall
 
 ```bash
-rm -f ~/.local/bin/lm ~/.local/bin/status ~/.local/bin/st
+rm -f ~/.local/bin/lm ~/.local/bin/status
+# then delete the "# --- lm-status aliases ---" block from ~/.aliases.sh or ~/.bashrc
 ```
 
 ## License

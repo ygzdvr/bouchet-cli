@@ -31,21 +31,40 @@ copy_or_fetch() {
 
 copy_or_fetch lm
 copy_or_fetch status
-ln -sfn status "$DEST/st"
+
+add_aliases() {
+  local rc="$1"
+  touch "$rc"
+  if grep -q 'lm-status aliases' "$rc"; then
+    return
+  fi
+  cat >> "$rc" <<'EOF'
+
+# --- lm-status aliases ---
+alias lm="$HOME/.local/bin/lm"
+alias limits="$HOME/.local/bin/lm"
+alias status="$HOME/.local/bin/status"
+alias st="$HOME/.local/bin/status"
+EOF
+}
+
+if [[ -f "$HOME/.aliases.sh" ]]; then
+  add_aliases "$HOME/.aliases.sh"
+else
+  add_aliases "$HOME/.bashrc"
+fi
 
 if ! [[ ":$PATH:" == *":$DEST:"* ]]; then
   echo
   echo "Add this to ~/.bashrc (Yale accounts usually already have it):"
   echo "  export PATH=\"\$HOME/.local/bin:\$PATH\""
-  echo "then:  source ~/.bashrc"
 fi
 
 echo
-echo "Installed:"
-echo "  $DEST/lm      AI coding limits (Claude + Codex)"
-echo "  $DEST/status  Slurm / YCRC cluster dashboard"
-echo "  $DEST/st      same as status"
+echo "Installed aliases:  lm  limits  status  st"
+echo "  lm / limits   AI coding limits (Claude + Codex)"
+echo "  status / st   Slurm / YCRC cluster dashboard"
 echo
-echo "Run:  lm"
-echo "      status"
-echo "      st"
+echo "Reload your shell once:  source ~/.bashrc"
+echo "Then run:  lm   or   limits"
+echo "           status   or   st"
