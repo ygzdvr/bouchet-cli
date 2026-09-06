@@ -1,21 +1,28 @@
 #!/usr/bin/env python3
-"""Show Claude Code and Codex usage limits.
+"""Show Claude Code, Codex, and Cursor usage limits.
 
 Claude: `claude -p /usage`
 Codex: `codex app-server` account/rateLimits/read (session + weekly)
+Cursor: dashboard usage-summary (Cursor models + third-party)
 
 Queries live on every run. Never prints tokens or email.
 """
 import argparse
+import base64
 import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from pathlib import Path
 
 W = 58
 BAR = 30
@@ -102,6 +109,30 @@ def fmt_reset(ts):
     hour = dt.hour % 12 or 12
     ampm = "am" if dt.hour < 12 else "pm"
     return f"{dt:%b} {dt.day}, {hour}:{dt:%M}{ampm}"
+
+
+def fmt_reset_any(value):
+    if value is None or value is False:
+        return None
+    if isinstance(value, (int, float)):
+        ts = float(value)
+        if ts > 1e12:
+            ts /= 1000.0
+        return fmt_reset(int(ts))
+    if isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.isdigit():
+            return fmt_reset_any(int(text))
+        try:
+            dt = datetime.fromisoformat(text.replace("Z", "+00:00"))
+            if dt.tzinfo is not None:
+                dt = dt.astimezone()
+            return fmt_reset(int(dt.timestamp()))
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+    return None
 
 
 def window_kind(mins):
@@ -219,6 +250,263 @@ def fetch_codex_limits(timeout=20):
                 pass
 
 
+def jwt_payload(token):
+    try:
+        part = token.split(".")[1]
+        part += "=" * (-len(part) % 4)
+        data = json.loads(base64.urlsafe_b64decode(part))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def jwt_sub(token):
+    sub = jwt_payload(token).get("sub")
+    return str(sub) if sub else None
+
+
+def strip_token(value):
+    if not value:
+        return None
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", "ignore")
+    text = str(value).strip().strip('"')
+    return text or None
+
+
+def token_from_auth_json(path):
+    data = load_json(str(path))
+    if not isinstance(data, dict):
+        return None
+    for key in ("accessToken", "access_token", "token"):
+        tok = strip_token(data.get(key))
+        if tok:
+            return tok
+    auth = data.get("auth")
+    if isinstance(auth, dict):
+        for key in ("accessToken", "access_token", "token"):
+            tok = strip_token(auth.get(key))
+            if tok:
+                return tok
+    return None
+
+
+def token_from_vscdb(path):
+    uris = [
+        f"file:{path}?mode=ro",
+        f"file:{path}?mode=ro&immutable=1",
+    ]
+    for uri in uris:
+        try:
+            conn = sqlite3.connect(uri, uri=True, timeout=1)
+        except sqlite3.Error:
+            continue
+        try:
+            row = conn.execute(
+                "SELECT value FROM ItemTable WHERE key = ?",
+                ("cursorAuth/accessToken",),
+            ).fetchone()
+        except sqlite3.Error:
+            row = None
+        finally:
+            conn.close()
+        tok = strip_token(row[0] if row else None)
+        if tok:
+            return tok
+    return None
+
+
+def cursor_token_paths():
+    home = Path.home()
+    paths = [
+        home / ".config" / "cursor" / "auth.json",
+        home / ".config" / "Cursor" / "User" / "globalStorage" / "state.vscdb",
+        home / ".cursor-server" / "data" / "User" / "globalStorage" / "state.vscdb",
+        home / ".local" / "share" / "cursor-agent" / "auth.json",
+        home / ".cursor" / "auth.json",
+        home / "Library" / "Application Support" / "Cursor" / "User" / "globalStorage" / "state.vscdb",
+    ]
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        paths.append(Path(appdata) / "Cursor" / "User" / "globalStorage" / "state.vscdb")
+    return paths
+
+
+def extra_cursor_files():
+    roots = [
+        Path.home() / ".cursor-server" / "data" / "User" / "globalStorage",
+        Path.home() / ".config" / "Cursor" / "User" / "globalStorage",
+        Path.home() / ".config" / "cursor",
+    ]
+    for root in roots:
+        if not root.is_dir():
+            continue
+        try:
+            yield from root.glob("state.vscdb")
+            yield from root.glob("auth.json")
+            yield from root.glob("*/auth.json")
+            yield from root.glob("*/*/auth.json")
+        except OSError:
+            continue
+
+
+def load_cursor_token():
+    for key in ("CURSOR_SESSION_TOKEN", "CURSOR_ACCESS_TOKEN"):
+        tok = strip_token(os.environ.get(key))
+        if tok:
+            return tok
+    seen = set()
+    for path in list(cursor_token_paths()) + list(extra_cursor_files()):
+        try:
+            path = path.resolve()
+        except OSError:
+            continue
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        if path.suffix == ".json":
+            tok = token_from_auth_json(path)
+        else:
+            tok = token_from_vscdb(path)
+        if tok:
+            return tok
+    return None
+
+
+def cursor_present():
+    home = Path.home()
+    return any((home / p).exists() for p in (
+        ".cursor-server",
+        ".config/Cursor",
+        ".config/cursor",
+        "Library/Application Support/Cursor",
+    )) or bool(os.environ.get("CURSOR_SESSION_TOKEN") or os.environ.get("CURSOR_ACCESS_TOKEN"))
+
+
+def split_cursor_cookie(token):
+    if "::" in token:
+        sub, jwt = token.split("::", 1)
+        return sub, jwt
+    return jwt_sub(token), token
+
+
+def cursor_cookie(token):
+    sub, jwt = split_cursor_cookie(token)
+    if not sub or not jwt:
+        return None
+    return "WorkosCursorSessionToken=" + urllib.parse.quote(f"{sub}::{jwt}", safe="")
+
+
+def http_json(url, token, method="GET", body=None, extra_headers=None, timeout=15):
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "lm",
+        "Origin": "https://cursor.com",
+    }
+    cookie = cursor_cookie(token)
+    if cookie:
+        headers["Cookie"] = cookie
+    jwt = split_cursor_cookie(token)[1] or token
+    headers["Authorization"] = "Bearer " + jwt
+    if extra_headers:
+        headers.update(extra_headers)
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", "ignore")
+    except (urllib.error.URLError, TimeoutError, OSError, ValueError):
+        return None
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+
+
+def walk_dicts(obj, depth=0):
+    if depth > 8:
+        return
+    if isinstance(obj, dict):
+        yield obj
+        for value in obj.values():
+            yield from walk_dicts(value, depth + 1)
+    elif isinstance(obj, list):
+        for item in obj[:20]:
+            yield from walk_dicts(item, depth + 1)
+
+
+def first_number(obj, *keys):
+    for blob in walk_dicts(obj):
+        for key in keys:
+            if key in blob:
+                try:
+                    return float(blob[key])
+                except (TypeError, ValueError):
+                    continue
+    return None
+
+
+def first_text(obj, *keys):
+    for blob in walk_dicts(obj):
+        for key in keys:
+            value = blob.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+    return None
+
+
+def cursor_plan_name(payload):
+    raw = first_text(payload, "membershipType", "planName", "plan", "membership")
+    if not raw:
+        return None
+    if raw.lower() in {"pro_plus", "proplus", "pro+"}:
+        return "pro plus"
+    return raw.replace("_", " ")
+
+
+def cursor_rows_from_payload(payload):
+    if not isinstance(payload, dict):
+        return []
+    auto = first_number(payload, "autoPercentUsed")
+    other = first_number(payload, "apiPercentUsed")
+    total = first_number(payload, "totalPercentUsed")
+    resets = fmt_reset_any(
+        first_text(payload, "billingCycleEnd", "endOfMonth", "resetsAt")
+        or first_number(payload, "billingCycleEnd", "endOfMonth", "resetsAt")
+    )
+    rows = []
+    if auto is not None:
+        rows.append(("Cursor models", int(round(auto)), resets))
+    if other is not None:
+        rows.append(("Third party", int(round(other)), resets))
+    if not rows and total is not None:
+        rows.append(("Included", int(round(total)), resets))
+    return rows
+
+
+def fetch_cursor_limits():
+    """Cursor models + third-party pools from the signed-in Cursor session."""
+    token = load_cursor_token()
+    if not token:
+        return [], None, False
+    summary = http_json("https://cursor.com/api/usage-summary", token)
+    period = http_json(
+        "https://api2.cursor.sh/aiserver.v1.DashboardService/GetCurrentPeriodUsage",
+        token,
+        method="POST",
+        body={},
+        extra_headers={"Connect-Protocol-Version": "1"},
+    )
+    rows = cursor_rows_from_payload(summary) or cursor_rows_from_payload(period)
+    plan = cursor_plan_name(summary) or cursor_plan_name(period)
+    return rows, plan, True
+
+
 def claude_plan():
     o = (load_json("~/.claude/.credentials.json") or {}).get("claudeAiOauth", {})
     bits = [o.get("subscriptionType"), o.get("rateLimitTier")]
@@ -227,25 +515,27 @@ def claude_plan():
 
 def fetch():
     print(f"{DIM}  querying usage...{Z}", end="\r", flush=True)
-    with ThreadPoolExecutor(max_workers=2) as pool:
+    with ThreadPoolExecutor(max_workers=3) as pool:
         f_claude = pool.submit(run, ["claude", "-p", "/usage"], 90)
         f_codex = pool.submit(fetch_codex_limits)
+        f_cursor = pool.submit(fetch_cursor_limits)
         claude_raw = f_claude.result()
         codex_rows, codex_plan, codex_ok = f_codex.result()
+        cursor_rows, cursor_plan, cursor_ok = f_cursor.result()
     print(" " * 40, end="\r")
-    return claude_raw, codex_rows, codex_plan, codex_ok
+    return claude_raw, codex_rows, codex_plan, codex_ok, cursor_rows, cursor_plan, cursor_ok
 
 
-def section(name, plan, rows, available, hint):
+def section(name, plan, rows, available, missing, empty):
     head = f" {B}{CY}{name}{Z}"
     if plan:
         head += f"   {DIM}{plan}{Z}"
     line(head)
     if not available:
-        line(f"   {YE}CLI not found on PATH{Z}")
+        line(f"   {DIM}{missing}{Z}")
         return
     if not rows:
-        line(f"   {DIM}no usage reported - {hint}{Z}")
+        line(f"   {DIM}{empty}{Z}")
         return
     for label, pct, resets in rows:
         remaining = max(0, 100 - int(pct))
@@ -259,20 +549,29 @@ def section(name, plan, rows, available, hint):
 
 def main():
     argparse.ArgumentParser(description="Usage limits").parse_args()
-    claude_raw, codex_rows, codex_plan, codex_ok = fetch()
+    claude_raw, codex_rows, codex_plan, codex_ok, cursor_rows, cursor_plan, cursor_ok = fetch()
 
     print()
     top("Usage Limits")
     line()
     section(
         "CLAUDE CODE", claude_plan(), parse_usage(claude_raw),
-        claude_raw is not None, "run: claude -p /usage",
+        claude_raw is not None, "CLI not found on PATH",
+        "no usage reported",
     )
     line()
     section(
         "CODEX", codex_plan, codex_rows,
-        codex_ok, "codex app-server unavailable",
+        codex_ok, "CLI not found on PATH",
+        "no usage reported",
     )
+    if cursor_ok or cursor_rows or cursor_present():
+        line()
+        section(
+            "CURSOR", cursor_plan, cursor_rows,
+            cursor_ok, "sign in to Cursor on this machine",
+            "no usage reported",
+        )
     line()
     bottom()
     print()

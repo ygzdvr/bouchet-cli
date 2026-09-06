@@ -17,9 +17,11 @@ Needs `python3`. Already on the cluster.
 
 Same command: `limits`.
 
-<img src="docs/lm.png" alt="lm showing usage limits for Claude and Codex" width="620">
+Shows Claude, Codex, and Cursor. Cursor has two bars: Cursor's own models, and third-party models.
 
-Green = lots left. Yellow = you're into the week.
+<img src="docs/lm.png" alt="lm showing usage limits for Claude, Codex, and Cursor" width="620">
+
+Green = lots left. Yellow = you're into the week. Cursor needs to be signed in on this computer.
 
 ## `status` = what's going on?
 
