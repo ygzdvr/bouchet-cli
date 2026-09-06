@@ -13,7 +13,7 @@ source ~/.bashrc
 
 Needs `python3`. Already on the cluster.
 
-## `lm` — usage limits
+## `lm` = usage limits
 
 Same command: `limits`.
 
@@ -21,7 +21,7 @@ Same command: `limits`.
 
 Green = lots left. Yellow = you're into the week.
 
-## `status` — what's going on?
+## `status` = what's going on?
 
 Same command: `st`.
 
@@ -29,7 +29,7 @@ Same command: `st`.
 
 Idle GPUs. Your job. This month. Disk. Fresh every time.
 
-## `cl` `cx` `clr` `cxr` `g` — skip the typing
+## `cl` `cx` `clr` `cxr` `g` = just skip the typing
 
 <img src="docs/aliases.png" alt="aliases for Claude, Codex, and git" width="520">
 
@@ -38,7 +38,7 @@ Idle GPUs. Your job. This month. Disk. Fresh every time.
 `clr` / `cxr` pick up the last chat.  
 `g` is git.
 
-## Bye
+## Not happy? Just remove.
 
 ```bash
 rm -f ~/.local/bin/lm ~/.local/bin/status
