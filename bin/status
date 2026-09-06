@@ -984,11 +984,11 @@ def render_job(job, user, here):
     state = job["state"]
     section("JOB")
     brow(
-        hcell("ID", 10), hcell("NAME", 12), hcell("PART", 9),
+        hcell("ID", 12), hcell("NAME", 12), hcell("PART", 9),
         hcell("QOS", 12), hcell("NODE", 12), hcell("STATE", 10),
     )
     brow(
-        dcell(job["id"], 10),
+        dcell(job["id"], 12),
         dcell(job["name"], 12),
         dcell(job["partition"], 9),
         dcell(job["qos"], 12),
@@ -1096,10 +1096,10 @@ def render_job(job, user, here):
         rows.append(("GPU", dcell("—", 21), gpu_label))
 
     if rows:
-        brow(hcell("METRIC", 6), hcell("USED", 21), hcell("DETAIL", 54))
+        brow(hcell("METRIC", 12), hcell("USED", 21), hcell("DETAIL", 48))
         for name, used_cell, detail in rows:
             used = pad_to(used_cell, 21) if "█" in used_cell or "░" in used_cell else used_cell
-            brow(dcell(name, 6), used, dcell(detail, 54))
+            brow(dcell(name, 12), used, dcell(detail, 48))
 
 
 def render_month(stats):
@@ -1172,8 +1172,8 @@ def render_recent(stats):
     recent = finished[:5]
     section("MOST RECENT")
     cols = [
-        ("ID", 8),
-        ("JOB", 16),
+        ("ID", 12),
+        ("JOB", 14),
         ("PART", 8),
         ("TIME", 7),
         ("STATE", 9),
@@ -1220,9 +1220,9 @@ def render_storage(data, user, group=None, scratch_oldest=None):
         stamp = data.get("timestamp") or ""
         stamp = re.sub(r"\s+\d{2}:\d{2}$", "", stamp)
     section("STORAGE", f"as of {stamp}" if stamp else "")
-    brow(hcell("FS", 8), hcell("USED", 21), hcell("SIZE", 16), hcell("NOTES", 39))
+    brow(hcell("FS", 12), hcell("USED", 21), hcell("SIZE", 16), hcell("NOTES", 35))
     if not data:
-        brow(dcell("—", 8), dcell("unavailable", 21), dcell("", 16), dcell("getquota failed", 39))
+        brow(dcell("—", 12), dcell("unavailable", 21), dcell("", 16), dcell("getquota failed", 35))
         return
     detail = {}
     for rows in (data.get("usage_detail") or {}).values():
@@ -1235,7 +1235,7 @@ def render_storage(data, user, group=None, scratch_oldest=None):
     order = {"home": 0, "project": 1, "scratch": 2}
     summaries.sort(key=lambda r: (order.get(r.get("fileset"), 9), r.get("fileset")))
     if not summaries:
-        brow(dcell("—", 8), dcell("", 21), dcell("", 16), dcell("no quota rows", 39))
+        brow(dcell("—", 12), dcell("", 21), dcell("", 16), dcell("no quota rows", 35))
         return
     for row in summaries:
         name = row.get("fileset") or "disk"
@@ -1261,10 +1261,10 @@ def render_storage(data, user, group=None, scratch_oldest=None):
             if days >= 25:
                 note_color = YE
         brow(
-            dcell(name, 8),
+            dcell(name, 12),
             pad_to(bar(pct), 21),
             dcell(f"{used:,.0f}/{total:,.0f} GiB", 16),
-            dcell(" · ".join(notes), 39, note_color),
+            dcell(" · ".join(notes), 35, note_color),
         )
 
 
@@ -1333,12 +1333,12 @@ def main():
     section("SESSION")
     share = f"{fs[0]:.2f}" if fs and fs[0] is not None else ""
     brow(
-        hcell("USER", 8), hcell("ACCOUNT", 10), hcell("QOS", 12),
-        hcell("CLUSTER", 8), hcell("HOST", 12), hcell("CPU", 18), hcell("SHARE", 6),
+        hcell("USER", 12), hcell("ACCOUNT", 10), hcell("QOS", 12),
+        hcell("CLUSTER", 8), hcell("HOST", 12), hcell("CPU", 14), hcell("SHARE", 6),
     )
     brow(
-        dcell(user, 8), dcell(account, 10), dcell(session_qos, 12),
-        dcell(cluster, 8), dcell(here, 12), dcell(model, 18), dcell(share, 6),
+        dcell(user, 12), dcell(account, 10), dcell(session_qos, 12),
+        dcell(cluster, 8), dcell(here, 12), dcell(model, 14), dcell(share, 6),
     )
 
     line()
@@ -1348,12 +1348,12 @@ def main():
         line()
         section("JOB")
         brow(
-            hcell("ID", 10), hcell("NAME", 12), hcell("PART", 9),
+            hcell("ID", 12), hcell("NAME", 12), hcell("PART", 9),
             hcell("QOS", 12), hcell("NODE", 12), hcell("STATE", 10),
         )
         why = "squeue down" if not jobs_ok else "none"
         brow(
-            dcell("—", 10), dcell(why, 12), dcell("", 9),
+            dcell("—", 12), dcell(why, 12), dcell("", 9),
             dcell("", 12), dcell("", 12), dcell("idle" if jobs_ok else "error", 10),
         )
     else:

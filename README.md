@@ -13,11 +13,11 @@ source ~/.bashrc
 
 Needs `python3`. Already on the cluster.
 
-## `lm` — how much AI is left?
+## `lm` — usage limits
 
 Same command: `limits`.
 
-<img src="docs/lm.png" alt="lm showing Claude and Codex usage bars" width="620">
+<img src="docs/lm.png" alt="lm showing usage limits for Claude and Codex" width="620">
 
 Green = lots left. Yellow = you're into the week.
 

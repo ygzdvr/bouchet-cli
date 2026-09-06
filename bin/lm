@@ -258,11 +258,11 @@ def section(name, plan, rows, available, hint):
 
 
 def main():
-    argparse.ArgumentParser(description="Claude Code / Codex usage limits").parse_args()
+    argparse.ArgumentParser(description="Usage limits").parse_args()
     claude_raw, codex_rows, codex_plan, codex_ok = fetch()
 
     print()
-    top("AI Coding Limits")
+    top("Usage Limits")
     line()
     section(
         "CLAUDE CODE", claude_plan(), parse_usage(claude_raw),

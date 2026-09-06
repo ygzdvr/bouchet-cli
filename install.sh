@@ -87,7 +87,7 @@ echo "Installed aliases:"
 echo "  g              git"
 echo "  cl / clr       Claude (skip permissions; clr resumes)"
 echo "  cx / cxr       Codex (--yolo; cxr resumes)"
-echo "  lm / limits    AI coding limits"
+echo "  lm / limits    usage limits"
 echo "  status / st    Slurm / YCRC cluster dashboard"
 echo
 echo "Reload your shell once:  source ~/.bashrc"
