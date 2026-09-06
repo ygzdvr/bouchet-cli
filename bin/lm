@@ -1,0 +1,283 @@
+#!/usr/bin/env python3
+"""Show Claude Code and Codex usage limits.
+
+Claude: `claude -p /usage`
+Codex: `codex app-server` account/rateLimits/read (session + weekly)
+
+Queries live on every run. Never prints tokens or email.
+"""
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+
+W = 58
+BAR = 30
+
+DIM, B, CY, GR, YE, RE, Z = (
+    "\033[2m", "\033[1m", "\033[36m", "\033[32m", "\033[33m", "\033[31m", "\033[0m",
+)
+ANSI = re.compile(r"\033\[[0-9;]*m")
+
+USAGE_RE = re.compile(
+    r"^\s*Current\s+([^:]+?)\s*:\s*(\d+)%\s*used(?:\s*[·.]\s*resets\s*(.+?))?\s*$",
+    re.M,
+)
+
+
+def vlen(s):
+    return len(ANSI.sub("", s))
+
+
+def line(s=""):
+    print("│ " + s + " " * max(0, W - vlen(s)) + " │")
+
+
+def top(title):
+    t = f" {title} "
+    left = (W + 2 - len(t)) // 2
+    print("╭" + "─" * left + t + "─" * ((W + 2) - len(t) - left) + "╮")
+
+
+def bottom():
+    print("╰" + "─" * (W + 2) + "╯")
+
+
+def colour(pct):
+    return GR if pct < 50 else (YE if pct < 80 else RE)
+
+
+def bar(pct):
+    pct = max(0, min(100, int(round(pct))))
+    fill = round(pct / 100 * BAR)
+    c = colour(pct)
+    return f"{c}{'█' * fill}{DIM}{'░' * (BAR - fill)}{Z} {c}{pct}%{Z}"
+
+
+def load_json(path):
+    try:
+        with open(os.path.expanduser(path)) as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def run(cmd, timeout=90):
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    return r.stdout or ""
+
+
+def parse_usage(text):
+    if not text:
+        return []
+    out = []
+    for label, pct, resets in USAGE_RE.findall(text):
+        label = re.sub(r"\s*\(all models\)", " (all)", label).strip()
+        resets = re.sub(r"\s*\([^)]*/[^)]*\)\s*$", "", (resets or "").strip())
+        out.append((label.capitalize(), int(pct), resets or None))
+    return out
+
+
+def fmt_reset(ts):
+    if not ts:
+        return None
+    try:
+        dt = datetime.fromtimestamp(int(ts))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return None
+    hour = dt.hour % 12 or 12
+    ampm = "am" if dt.hour < 12 else "pm"
+    return f"{dt:%b} {dt.day}, {hour}:{dt:%M}{ampm}"
+
+
+def window_kind(mins):
+    try:
+        mins = float(mins)
+    except (TypeError, ValueError):
+        return None
+    if 240 <= mins <= 420:
+        return "Session"
+    if 9000 <= mins <= 12000:
+        return "Weekly"
+    if 1200 <= mins <= 1800:
+        return "Daily"
+    return None
+
+
+def rows_from_rate_limits(result):
+    session = weekly = None
+
+    def take(win, prefer_weekly=False):
+        nonlocal session, weekly
+        if not isinstance(win, dict) or win.get("usedPercent") is None:
+            return
+        kind = window_kind(win.get("windowDurationMins"))
+        used = int(round(float(win["usedPercent"])))
+        resets = fmt_reset(win.get("resetsAt"))
+        if kind == "Session" and session is None:
+            session = ("Session", used, resets)
+        elif kind == "Weekly" and (weekly is None or prefer_weekly):
+            weekly = ("Weekly", used, resets)
+
+    main = result.get("rateLimits") or {}
+    take(main.get("primary"), prefer_weekly=True)
+    take(main.get("secondary"), prefer_weekly=True)
+    if session is None or weekly is None:
+        extra = result.get("rateLimitsByLimitId") or {}
+        for lid, blob in extra.items():
+            blob = blob or {}
+            prefer = lid == "codex"
+            take(blob.get("primary"), prefer_weekly=prefer)
+            take(blob.get("secondary"), prefer_weekly=prefer)
+    return [row for row in (session, weekly) if row]
+
+
+def fetch_codex_limits(timeout=20):
+    """Talk to `codex app-server` JSON-RPC. Returns (rows, plan, available)."""
+    if not shutil.which("codex"):
+        return [], None, False
+    try:
+        proc = subprocess.Popen(
+            ["codex", "app-server", "--listen", "stdio://"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            text=True, bufsize=1,
+        )
+    except OSError:
+        return [], None, True
+
+    def send(obj):
+        proc.stdin.write(json.dumps(obj) + "\n")
+        proc.stdin.flush()
+
+    got = {}
+    plan = None
+    try:
+        send({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "lm", "title": "lm", "version": "1"},
+                "capabilities": {"experimentalApi": True},
+            },
+        })
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            line = proc.stdout.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                msg = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            mid = msg.get("id")
+            if mid == 1:
+                send({"method": "initialized", "params": {}})
+                send({"id": 2, "method": "account/read", "params": {"refreshToken": False}})
+                send({"id": 3, "method": "account/rateLimits/read", "params": {}})
+            if mid in (2, 3):
+                got[mid] = msg
+            if 3 in got:
+                break
+        acc = ((got.get(2) or {}).get("result") or {}).get("account") or {}
+        plan_type = acc.get("planType") or acc.get("chatgptPlanType")
+        bits = []
+        if acc.get("type"):
+            bits.append(str(acc["type"]))
+        if plan_type:
+            bits.append(str(plan_type).replace("_", " "))
+        plan = " · ".join(bits) or None
+        result = (got.get(3) or {}).get("result") or {}
+        rows = rows_from_rate_limits(result)
+        return rows, plan, True
+    except Exception:
+        return [], plan, True
+    finally:
+        try:
+            proc.terminate()
+            proc.wait(timeout=2)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+
+def claude_plan():
+    o = (load_json("~/.claude/.credentials.json") or {}).get("claudeAiOauth", {})
+    bits = [o.get("subscriptionType"), o.get("rateLimitTier")]
+    return " · ".join(b for b in bits if b)
+
+
+def fetch():
+    print(f"{DIM}  querying usage...{Z}", end="\r", flush=True)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        f_claude = pool.submit(run, ["claude", "-p", "/usage"], 90)
+        f_codex = pool.submit(fetch_codex_limits)
+        claude_raw = f_claude.result()
+        codex_rows, codex_plan, codex_ok = f_codex.result()
+    print(" " * 40, end="\r")
+    return claude_raw, codex_rows, codex_plan, codex_ok
+
+
+def section(name, plan, rows, available, hint):
+    head = f" {B}{CY}{name}{Z}"
+    if plan:
+        head += f"   {DIM}{plan}{Z}"
+    line(head)
+    if not available:
+        line(f"   {YE}CLI not found on PATH{Z}")
+        return
+    if not rows:
+        line(f"   {DIM}no usage reported - {hint}{Z}")
+        return
+    for label, pct, resets in rows:
+        remaining = max(0, 100 - int(pct))
+        line()
+        line(f"   {label}")
+        line(f"   {bar(pct)}")
+        line(f"   {DIM}remaining {remaining}%{Z}")
+        if resets:
+            line(f"   {DIM}resets {resets}{Z}")
+
+
+def main():
+    argparse.ArgumentParser(description="Claude Code / Codex usage limits").parse_args()
+    claude_raw, codex_rows, codex_plan, codex_ok = fetch()
+
+    print()
+    top("AI Coding Limits")
+    line()
+    section(
+        "CLAUDE CODE", claude_plan(), parse_usage(claude_raw),
+        claude_raw is not None, "run: claude -p /usage",
+    )
+    line()
+    section(
+        "CODEX", codex_plan, codex_rows,
+        codex_ok, "codex app-server unavailable",
+    )
+    line()
+    bottom()
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

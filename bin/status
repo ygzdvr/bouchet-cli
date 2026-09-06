@@ -1,0 +1,1385 @@
+#!/usr/bin/env python3
+"""Cluster status dashboard — jobs, monthly usage, and storage."""
+
+import argparse
+import glob
+import json
+import os
+import pwd
+import re
+import shutil
+import subprocess
+import sys
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta
+
+W = 96
+BAR = 16
+
+DIM, B, CY, GR, YE, RE, Z = (
+    "\033[2m", "\033[1m", "\033[36m", "\033[32m", "\033[33m", "\033[31m", "\033[0m",
+)
+ANSI = re.compile(r"\033\[[0-9;]*m")
+
+
+def vlen(s):
+    return len(ANSI.sub("", s))
+
+
+def vis_trunc(s, n):
+    if vlen(s) <= n:
+        return s
+    if n <= 1:
+        return "…"
+    limit = n - 1
+    out = []
+    vis = 0
+    i = 0
+    while i < len(s) and vis < limit:
+        if s[i] == "\033":
+            match = ANSI.match(s, i)
+            if match:
+                out.append(match.group(0))
+                i = match.end()
+                continue
+        out.append(s[i])
+        vis += 1
+        i += 1
+    return "".join(out) + "…" + Z
+
+
+def line(s=""):
+    s = vis_trunc(s, W)
+    print("│ " + s + " " * max(0, W - vlen(s)) + " │")
+
+
+def top(title):
+    t = f" {title} "
+    left = (W + 2 - len(t)) // 2
+    print("╭" + "─" * left + t + "─" * ((W + 2) - len(t) - left) + "╮")
+
+
+def bottom():
+    print("╰" + "─" * (W + 2) + "╯")
+
+
+def colour(pct):
+    return GR if pct < 50 else (YE if pct < 80 else RE)
+
+
+def activity_colour(pct):
+    if pct < 2:
+        return DIM
+    if pct < 25:
+        return CY
+    return GR
+
+
+def set_width():
+    global W
+    cols = shutil.get_terminal_size((100, 24)).columns
+    W = max(78, min(100, cols - 4))
+
+
+def pad_to(s, n):
+    return s + " " * max(0, n - vlen(s))
+
+
+def bar(pct, width=None, warn=True):
+    width = BAR if width is None else width
+    pct = max(0, min(100, int(round(pct))))
+    fill = round(pct / 100 * width)
+    c = colour(pct) if warn else activity_colour(pct)
+    return f"{c}{'█' * fill}{DIM}{'░' * (width - fill)}{Z} {c}{pct:>3}%{Z}"
+
+
+def run(cmd, timeout=20):
+    try:
+        r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        return None
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    out = r.stdout or ""
+    if r.returncode != 0 and not out.strip():
+        return None
+    return out
+
+
+def current_user():
+    for key in ("SLURM_JOB_USER", "SUDO_USER", "USER", "LOGNAME"):
+        val = (os.environ.get(key) or "").strip()
+        if val and val != "root":
+            return val
+    job = os.environ.get("SLURM_JOB_ID")
+    if job:
+        text = run(["scontrol", "show", "job", str(job)]) or ""
+        match = re.search(r"UserId=([^(=\s]+)", text)
+        if match and match.group(1) != "root":
+            return match.group(1)
+    try:
+        name = pwd.getpwuid(os.getuid()).pw_name
+        if name != "root":
+            return name
+    except KeyError:
+        pass
+    return os.environ.get("USER") or "unknown"
+
+
+def short_host():
+    return os.uname().nodename.split(".")[0]
+
+
+def parse_tres(text):
+    values = {}
+    for item in (text or "").split(","):
+        if "=" in item:
+            key, value = item.split("=", 1)
+            values[key.strip()] = value.strip()
+    return values
+
+
+def number(value):
+    match = re.search(r"[0-9]+(?:\.[0-9]+)?", value or "")
+    return float(match.group()) if match else 0.0
+
+
+def parse_total_cpu(text):
+    text = (text or "").strip()
+    if not text:
+        return None
+    # sacct TotalCPU is MM:SS.sss under an hour, otherwise [DD-]HH:MM:SS
+    if text.count(":") == 1:
+        minutes, seconds = text.split(":", 1)
+        try:
+            return timedelta(minutes=int(minutes), seconds=float(seconds))
+        except ValueError:
+            return None
+    return parse_slurm_time(text)
+
+
+def fmt_exit(code, state):
+    st = (state or "").upper()
+    if st == "TIMEOUT":
+        return None
+    if st in {"OUT_OF_MEMORY", "OOM"}:
+        return "oom"
+    match = re.match(r"(\d+):(\d+)", code or "")
+    if not match:
+        return None
+    status, sig = int(match.group(1)), int(match.group(2))
+    if sig:
+        return f"sig {sig}"
+    if status:
+        return f"exit {status}"
+    return None
+
+
+def parse_slurm_time(text):
+    """Parse a Slurm duration.
+
+    3-part clock is hours:minutes:seconds (sacct, TimeLimit, TIME_LEFT >= 1h).
+    2-part clock is minutes:seconds — squeue TIME under one hour is `M:SS`,
+    not hours:minutes.
+    """
+    text = (text or "").strip()
+    if not text or text.upper() in {"UNLIMITED", "INVALID", "N/A", "NONE"}:
+        return None
+    days = 0
+    if "-" in text:
+        day_part, rest = text.split("-", 1)
+        try:
+            days = int(day_part)
+        except ValueError:
+            return None
+        text = rest
+    parts = text.split(":")
+    try:
+        nums = [float(p) if i == len(parts) - 1 else int(p) for i, p in enumerate(parts)]
+    except ValueError:
+        return None
+    if len(nums) == 3:
+        hours, minutes, seconds = nums
+    elif len(nums) == 2:
+        hours, minutes, seconds = 0, nums[0], nums[1]
+    elif len(nums) == 1:
+        hours, minutes, seconds = 0, 0, nums[0]
+    else:
+        return None
+    try:
+        return timedelta(
+            days=days, hours=int(hours), minutes=int(minutes), seconds=float(seconds),
+        )
+    except (ValueError, OverflowError):
+        return None
+
+
+def parse_slurm_dt(text):
+    text = (text or "").strip()
+    if not text or text.lower() in {"unknown", "n/a", "none"}:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M"):
+        try:
+            return datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def fmt_dur(td):
+    if td is None:
+        return "?"
+    secs = max(0, int(round(td.total_seconds())))
+    days, rem = divmod(secs, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, sec = divmod(rem, 60)
+    if days:
+        return f"{days}d {hours}h {minutes:02d}m"
+    if hours:
+        return f"{hours}h {minutes:02d}m" if minutes else f"{hours}h"
+    if minutes:
+        return f"{minutes}m {sec:02d}s" if sec else f"{minutes}m"
+    return f"{secs}s"
+
+
+def fmt_clock(dt):
+    hour = dt.hour % 12 or 12
+    ampm = "AM" if dt.hour < 12 else "PM"
+    return f"{hour}:{dt:%M} {ampm}"
+
+
+def fmt_when(text):
+    dt = parse_slurm_dt(text)
+    if not dt:
+        return None
+    clock = fmt_clock(dt)
+    today = datetime.now().date()
+    if dt.date() == today:
+        return clock
+    if dt.date() == today + timedelta(days=1):
+        return f"{clock} tomorrow"
+    if dt.date() == today - timedelta(days=1):
+        return f"{clock} yesterday"
+    return f"{dt:%b} {dt.day} {clock}"
+
+
+def mem_to_gib(text):
+    text = (text or "").strip().replace(" ", "")
+    if not text or text.upper() in {"N/A", "NONE"}:
+        return 0.0
+    text = re.sub(r"[cn]$", "", text, flags=re.I)  # Slurm per-cpu / per-node
+    match = re.match(r"([0-9.]+)([KMGT])I?B?$", text, re.I)
+    if not match:
+        match = re.match(r"([0-9.]+)$", text)
+        if not match:
+            return 0.0
+        return float(match.group(1)) / (1024 ** 3)
+    n, unit = float(match.group(1)), match.group(2).upper()
+    factor = {"K": 1 / 1024 ** 2, "M": 1 / 1024, "G": 1, "T": 1024}[unit]
+    return n * factor
+
+
+def kb_to_gib(kb):
+    return float(kb or 0) / (1024 ** 2)
+
+
+def fmt_gib(n, decimals=None):
+    n = float(n)
+    if decimals is None:
+        decimals = 0 if n >= 100 else 1
+    value = f"{n:.{decimals}f}"
+    if value.endswith(".0"):
+        value = value[:-2]
+    return f"{value}G"
+
+
+def fmt_int(n):
+    return f"{int(n):,}"
+
+
+def gpu_from_tres(tres_text, tres_per_node=""):
+    tres = parse_tres(tres_text)
+    for key, value in tres.items():
+        if key.startswith("gres/gpu:"):
+            kind = pretty_gpu(key.split(":", 1)[1])
+            count = int(number(value))
+            if count:
+                return f"{count}× {kind}"
+    if number(tres.get("gres/gpu", "0")):
+        return f"{int(number(tres['gres/gpu']))}× GPU"
+    text = (tres_per_node or "").strip()
+    if text and text.upper() not in {"N/A", "NONE"}:
+        text = text.replace("gres/gpu:", "").replace("gres/gpu=", "")
+        return pretty_gpu(text)
+    return None
+
+
+def pretty_gpu(name):
+    if not name:
+        return None
+    raw = re.sub(r"[:].*", "", str(name).strip())
+    key = raw.lower().replace(" ", "_")
+    table = {
+        "h100": "H100", "h200": "H200", "b200": "B200", "a40": "A40",
+        "l40s": "L40S", "a5000": "A5000", "rtx_5000_ada": "RTX 5000 Ada",
+        "rtx_pro_6000_blackwell": "RTX PRO 6000", "gpu": "GPU",
+    }
+    return table.get(key, raw)
+
+
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except OSError:
+        return ""
+
+
+def job_cgroup(job_id):
+    uid = os.getuid()
+    for path in (
+        f"/sys/fs/cgroup/system.slice/slurmstepd.scope/job_{job_id}",
+        f"/sys/fs/cgroup/slurm/uid_{uid}/job_{job_id}",
+        f"/sys/fs/cgroup/cpu/slurm/uid_{uid}/job_{job_id}",
+    ):
+        if os.path.isdir(path):
+            return path
+    return None
+
+
+def cgroup_cpu_pct(job_id, ncpus, sample=0.25):
+    path = job_cgroup(job_id)
+    if not path or not ncpus:
+        return None
+    stat = os.path.join(path, "cpu.stat")
+
+    def usage():
+        for row in read_text(stat).splitlines():
+            if row.startswith("usage_usec"):
+                try:
+                    return int(row.split()[1])
+                except (IndexError, ValueError):
+                    return None
+        return None
+
+    first = usage()
+    if first is None:
+        return None
+    t0 = time.monotonic()
+    time.sleep(sample)
+    second = usage()
+    dt = time.monotonic() - t0
+    if second is None or dt <= 0:
+        return None
+    busy = (second - first) / (dt * 1_000_000)
+    return max(0.0, min(100.0, busy / int(ncpus) * 100))
+
+
+def ps_cpu_pct(user, ncpus):
+    if not ncpus:
+        return None
+    out = run(["ps", "-u", user, "-o", "pcpu="])
+    if not out:
+        return None
+    total = 0.0
+    for row in out.split():
+        try:
+            total += float(row)
+        except ValueError:
+            continue
+    return max(0.0, min(100.0, total / int(ncpus)))
+
+
+def parse_cpuset(spec):
+    cpus = []
+    for part in (spec or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+            try:
+                cpus.extend(range(int(a), int(b) + 1))
+            except ValueError:
+                continue
+        else:
+            try:
+                cpus.append(int(part))
+            except ValueError:
+                continue
+    return cpus
+
+
+def package_temps():
+    temps = {}
+    for hwmon in glob.glob("/sys/class/hwmon/hwmon*"):
+        if read_text(os.path.join(hwmon, "name")) != "coretemp":
+            continue
+        for label_path in glob.glob(os.path.join(hwmon, "temp*_label")):
+            match = re.match(r"Package id (\d+)", read_text(label_path))
+            if not match:
+                continue
+            raw = read_text(label_path.replace("_label", "_input"))
+            try:
+                temps[int(match.group(1))] = int(raw) / 1000
+            except ValueError:
+                continue
+    if temps:
+        return temps
+    pkgs = []
+    for zone in glob.glob("/sys/class/thermal/thermal_zone*"):
+        if read_text(os.path.join(zone, "type")) != "x86_pkg_temp":
+            continue
+        raw = read_text(os.path.join(zone, "temp"))
+        try:
+            pkgs.append(int(raw) / 1000)
+        except ValueError:
+            continue
+    return {i: t for i, t in enumerate(pkgs)}
+
+
+def job_cpu_temp(job_id):
+    temps = package_temps()
+    if not temps:
+        return None
+    path = job_cgroup(job_id)
+    pkgs = set()
+    if path:
+        spec = read_text(os.path.join(path, "cpuset.cpus.effective")) or read_text(
+            os.path.join(path, "cpuset.cpus")
+        )
+        for cpu in parse_cpuset(spec):
+            pkg = read_text(f"/sys/devices/system/cpu/cpu{cpu}/topology/physical_package_id")
+            try:
+                pkgs.add(int(pkg))
+            except ValueError:
+                continue
+    picked = [temps[p] for p in pkgs if p in temps]
+    return max(picked) if picked else max(temps.values())
+
+
+def fmt_temp(celsius):
+    if celsius is None:
+        return None
+    t = int(round(float(celsius)))
+    col = RE if t >= 90 else YE if t >= 80 else DIM
+    return f"{col}{t}°C{Z}"
+
+
+def job_mem_gib(job_id):
+    path = job_cgroup(job_id)
+    if not path:
+        return None
+    for name in ("memory.current", "memory.usage_in_bytes"):
+        raw = read_text(os.path.join(path, name))
+        if not raw:
+            continue
+        try:
+            return int(raw.split()[0]) / 1024 ** 3
+        except ValueError:
+            continue
+    return None
+
+
+def local_rss_gib(user):
+    out = run(["ps", "-u", user, "-o", "rss="])
+    if not out:
+        return None
+    total = 0
+    for row in out.split():
+        try:
+            total += int(row)
+        except ValueError:
+            continue
+    return total / 1024 ** 2 if total else 0.0
+
+
+def sstat_peak_gib(job_id):
+    raw = run(["sstat", "-j", str(job_id), "--allsteps", "-n", "-P", "-o", "MaxRSS"])
+    if not raw:
+        return None
+    peak = 0.0
+    for row in raw.splitlines():
+        val = row.split("|")[0].strip()
+        if val:
+            peak = max(peak, mem_to_gib(val))
+    return peak if peak else None
+
+
+def nvidia():
+    if not shutil.which("nvidia-smi"):
+        return []
+    raw = run([
+        "nvidia-smi",
+        "--query-gpu=index,name,utilization.gpu,temperature.gpu,memory.used,memory.total",
+        "--format=csv,noheader,nounits",
+    ], timeout=5)
+    if not raw:
+        return []
+    gpus = []
+    for row in raw.splitlines():
+        low = row.lower()
+        if "failed" in low or "error" in low or "not supported" in low:
+            continue
+        parts = [p.strip() for p in row.split(",", 5)]
+        if len(parts) < 6:
+            continue
+        try:
+            gpus.append({
+                "index": parts[0],
+                "name": re.sub(r"^NVIDIA\s+", "", parts[1]),
+                "util": float(parts[2]),
+                "temp": parts[3],
+                "mem_used": float(parts[4]) / 1024,
+                "mem_total": float(parts[5]) / 1024,
+            })
+        except ValueError:
+            continue
+    return gpus
+
+
+def cpu_model():
+    try:
+        with open("/proc/cpuinfo") as f:
+            for row in f:
+                if row.startswith("model name"):
+                    name = re.sub(r"\(R\)|\(TM\)", "", row.split(":", 1)[1])
+                    name = re.sub(r"\s+", " ", name).strip()
+                    match = re.search(r"(Xeon|EPYC).+?(\S+\+?)$", name, re.I)
+                    if match:
+                        return f"{match.group(1).title()} {match.group(2)}"
+                    return clip(name, 24)
+    except OSError:
+        pass
+    return None
+
+
+_NODE = {}
+
+
+def node_facts(node):
+    if not node:
+        return {}
+    if node in _NODE:
+        return _NODE[node]
+    raw = run(["scontrol", "show", "node", node]) or ""
+    facts = {}
+    match = re.search(r"cpumodel:([^,]+)", raw)
+    facts["cpu"] = match.group(1) if match else None
+
+    def grab(key):
+        found = re.search(rf"{key}=(\S+)", raw)
+        return found.group(1) if found else None
+
+    facts["alloc"] = grab("CPUAlloc")
+    facts["tot"] = grab("CPUTot") or grab("CPUEfctv")
+    facts["load"] = grab("CPULoad")
+    _NODE[node] = facts
+    return facts
+
+
+def node_cpu_model(node):
+    return node_facts(node).get("cpu")
+
+
+def parse_gpu_count(text):
+    found = []
+    for kind, count in re.findall(r"gpu:([^:(),]+):(\d+)", text or ""):
+        found.append((kind, int(count)))
+    return found
+
+
+def node_available(state):
+    st = (state or "").lower().strip()
+    flags = set()
+    while st and st[-1] in "*~#$%@":
+        flags.add(st[-1])
+        st = st[:-1]
+    if flags & set("*$@%"):
+        return False
+    skip = ("drain", "down", "fail", "maint", "npc", "nolo", "resv", "unk", "drng", "plnd", "planned")
+    return not any(st.startswith(s) for s in skip)
+
+
+def cluster_idle():
+    widths = (32, 24, 80, 80, 20, 24)
+    raw = run([
+        "sinfo", "-N", "-h", "-O",
+        "NodeHost:32,Partition:24,Gres:80,GresUsed:80,StateCompact:20,CPUsState:24",
+    ])
+    if not raw:
+        return {}, {}
+    gpu_idle = defaultdict(int)
+    cpu_idle = defaultdict(int)
+    seen_gpu = set()
+    for row in raw.splitlines():
+        if slurm_error_line(row):
+            continue
+        i = 0
+        fields = []
+        for w in widths:
+            fields.append(row[i:i + w].strip())
+            i += w
+        if len(fields) < 6:
+            continue
+        node, part, gres, used, state, cpus = fields
+        part = part.rstrip("*")
+        up = node_available(state)
+        if node and node not in seen_gpu:
+            seen_gpu.add(node)
+            have = dict(parse_gpu_count(gres))
+            taken = dict(parse_gpu_count(used))
+            if up:
+                for kind, n in have.items():
+                    gpu_idle[kind] += max(0, n - taken.get(kind, 0))
+        if up and re.match(r"\d+/\d+/\d+/\d+$", cpus):
+            _alloc, idle, _other, _tot = (int(x) for x in cpus.split("/"))
+            if part:
+                cpu_idle[part] += idle
+    return gpu_idle, cpu_idle
+
+
+def slurm_error_line(row):
+    low = (row or "").strip().lower()
+    return (
+        "unable to contact slurm" in low
+        or low.startswith("slurm_load")
+        or low.startswith("squeue: error")
+        or low.startswith("sinfo: error")
+        or low.startswith("sacct: error")
+        or low.startswith("scontrol: error")
+        or low.startswith("sshare: error")
+    )
+
+
+def host_in_nodelist(here, nodelist):
+    nodes = (nodelist or "").strip()
+    if not nodes or nodes.lower() in {"(null)", "unknown", "n/a", "none"}:
+        return False
+    if here == nodes or here in {n.strip() for n in nodes.split(",") if n.strip()}:
+        return True
+    if "[" in nodes:
+        names = run(["scontrol", "show", "hostnames", nodes], timeout=5) or ""
+        return here in names.split()
+    return False
+
+
+def first_hostname(nodelist):
+    nodes = (nodelist or "").strip()
+    if not nodes or nodes.lower() in {"(null)", "unknown", "n/a", "none"}:
+        return ""
+    first = nodes.split(",")[0].strip()
+    if "[" in first:
+        names = (run(["scontrol", "show", "hostnames", nodes], timeout=5) or "").split()
+        return names[0] if names else first
+    return first
+
+
+def on_this_node(job, here):
+    env_id = (os.environ.get("SLURM_JOB_ID") or "").strip()
+    jid = str(job.get("id") or "").split(".", 1)[0]
+    if env_id and (env_id == jid or jid.startswith(env_id + "_") or env_id.startswith(jid + "_")):
+        return True
+    return host_in_nodelist(here, job.get("node"))
+
+
+def scratch_root(user):
+    env = os.environ.get("SCRATCH")
+    if env and os.path.isdir(env):
+        return env
+    home = os.path.expanduser("~")
+    for path in glob.glob(os.path.join(home, "scratch_*", user)) + glob.glob(os.path.join(home, "scratch_*")):
+        if os.path.isdir(path):
+            return path
+    return None
+
+
+def scratch_oldest(root, budget=1.5):
+    if not root or not os.path.isdir(root):
+        return None
+    oldest = None
+    stack = [root]
+    n = 0
+    t0 = time.monotonic()
+    while stack and time.monotonic() - t0 < budget and n < 12000:
+        path = stack.pop()
+        try:
+            with os.scandir(path) as it:
+                for ent in it:
+                    n += 1
+                    try:
+                        mtime = ent.stat(follow_symlinks=False).st_mtime
+                    except OSError:
+                        continue
+                    if oldest is None or mtime < oldest:
+                        oldest = mtime
+                    if ent.is_dir(follow_symlinks=False) and n < 8000:
+                        stack.append(ent.path)
+        except OSError:
+            continue
+    return oldest
+
+
+def current_jobs(user):
+    raw = run([
+        "squeue", "-u", user, "-h", "-o",
+        "%i|%P|%j|%T|%M|%l|%C|%m|%b|%R|%S|%L|%N|%q|%a|%e",
+    ])
+    if raw is None:
+        return None
+    jobs = []
+    for row in raw.splitlines():
+        if not row.strip() or slurm_error_line(row):
+            continue
+        parts = row.split("|")
+        if len(parts) < 16:
+            continue
+        (job, partition, name, state, elapsed, limit, cpu, memory,
+         gpu, reason, start, left, node, qos, account, end) = parts[:16]
+        jobs.append({
+            "id": job,
+            "partition": partition,
+            "name": name,
+            "state": state,
+            "elapsed": elapsed,
+            "limit": limit,
+            "cpu": cpu,
+            "memory": memory,
+            "gpu": gpu,
+            "reason": reason,
+            "start": start,
+            "left": left,
+            "node": node,
+            "qos": qos,
+            "account": account,
+            "end": end,
+            "tres": "",
+        })
+    extra = run(["squeue", "-u", user, "-h", "-O", "JobID:32,tres-alloc:200"]) or ""
+    tres_map = {}
+    for row in extra.splitlines():
+        if not row.strip() or slurm_error_line(row):
+            continue
+        jid, rest = row[:32].strip(), row[32:].strip()
+        if jid:
+            tres_map[jid] = rest
+    for job in jobs:
+        job["tres"] = tres_map.get(job["id"], "")
+    return jobs
+
+
+def month_stats(user):
+    start = datetime.now().strftime("%Y-%m-01")
+    raw = run([
+        "sacct", "-u", user, "-S", start, "-n", "-P",
+        "-o", "JobID,JobName,Partition,State,Elapsed,AllocTRES,End,ExitCode,ReqMem,MaxRSS,TotalCPU,NCPUS",
+    ])
+    stats = {
+        "ok": raw is not None,
+        "jobs": 0,
+        "cpu": 0.0,
+        "gpu": defaultdict(float),
+        "partition": defaultdict(float),
+        "states": defaultdict(int),
+        "recent": [],
+    }
+    by_id = {}
+    if not raw:
+        return stats
+    for row in raw.splitlines():
+        if slurm_error_line(row):
+            stats["ok"] = False
+            continue
+        parts = row.split("|")
+        if len(parts) < 12:
+            continue
+        (job, name, partition, state, elapsed, tres_text, end,
+         exitcode, reqmem, maxrss, totalcpu, ncpus_field) = parts[:12]
+        base = job.split(".", 1)[0]
+        is_step = "." in job
+        rss = mem_to_gib(maxrss) if maxrss else 0.0
+        cpu_used = parse_total_cpu(totalcpu)
+        if not is_step:
+            state = (state or "").split()[0]
+            hours = (parse_slurm_time(elapsed) or timedelta()).total_seconds() / 3600
+            tres = parse_tres(tres_text)
+            if not hours and not tres and state in {"PENDING", "REQUEUED"}:
+                continue
+            stats["jobs"] += 1
+            stats["states"][state] += 1
+            ncpus = number(tres.get("cpu", "0")) or number(ncpus_field)
+            cpu_hours = hours * ncpus
+            stats["cpu"] += cpu_hours
+            stats["partition"][partition or "unknown"] += cpu_hours
+            typed = False
+            for key, value in tres.items():
+                if key.startswith("gres/gpu:"):
+                    stats["gpu"][key.split(":", 1)[1]] += hours * number(value)
+                    typed = True
+            if not typed and number(tres.get("gres/gpu", "0")):
+                stats["gpu"]["gpu"] += hours * number(tres["gres/gpu"])
+            rec = {
+                "id": base,
+                "name": name,
+                "partition": partition,
+                "state": state,
+                "elapsed": elapsed,
+                "end": end,
+                "gpu": gpu_from_tres(tres_text),
+                "cpu_hours": cpu_hours,
+                "ncpus": ncpus,
+                "exit": exitcode,
+                "reqmem": mem_to_gib(reqmem) if reqmem else 0.0,
+                "maxrss": rss,
+                "cpu_used": cpu_used,
+            }
+            by_id[base] = rec
+            stats["recent"].append(rec)
+        elif base in by_id:
+            rec = by_id[base]
+            if rss:
+                rec["maxrss"] = max(rec.get("maxrss") or 0.0, rss)
+            if cpu_used and (
+                rec.get("cpu_used") is None
+                or cpu_used > rec["cpu_used"]
+            ):
+                rec["cpu_used"] = cpu_used
+    stats["recent"].sort(
+        key=lambda j: j["end"] if j["end"] not in {"Unknown", ""} else "",
+        reverse=True,
+    )
+    return stats
+
+
+def fairshare(user, account):
+    if not account:
+        return None
+    raw = run(["sshare", "-A", account, "-u", user, "--parsable2"])
+    if not raw:
+        return None
+    lines = [ln for ln in raw.splitlines() if ln.strip() and not slurm_error_line(ln)]
+    if not lines:
+        return None
+    header = [h.strip() for h in lines[0].split("|")]
+    try:
+        i_acct, i_user, i_fs = header.index("Account"), header.index("User"), header.index("FairShare")
+    except ValueError:
+        i_acct, i_user, i_fs = 0, 1, len(header) - 1
+    user_fs = account_fs = None
+    for row in lines[1:]:
+        parts = row.split("|")
+        if max(i_acct, i_user, i_fs) >= len(parts):
+            continue
+        acct, uname, fs = parts[i_acct].strip(), parts[i_user].strip(), parts[i_fs].strip()
+        try:
+            val = float(fs) if fs else None
+        except ValueError:
+            val = None
+        if uname == user:
+            user_fs = val
+        elif uname == "" and acct == account:
+            account_fs = val
+    return user_fs, account_fs
+
+
+def load_quota(user):
+    empty = {"data": None, "group": None, "scratch_oldest": None}
+    if not shutil.which("getquota"):
+        return empty
+    raw = run(["getquota", "--json", "-u", user], timeout=30)
+    data = None
+    if raw:
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            data = None
+    return {
+        "data": data,
+        "group": None,
+        "scratch_oldest": scratch_oldest(scratch_root(user)),
+    }
+
+
+def assoc_info(user):
+    raw = run([
+        "sacctmgr", "show", "user", user, "withassoc", "-n", "-P",
+        "format=Account,QOS",
+    ])
+    account = qos = None
+    if raw:
+        for row in raw.splitlines():
+            if "|" not in row or slurm_error_line(row):
+                continue
+            acc, q = (p.strip() for p in row.split("|", 1))
+            if acc and acc != "unknown":
+                account = acc
+            if q:
+                qos = q.replace(",", ", ")
+            break
+    cluster = None
+    cfg = run(["scontrol", "show", "config"]) or ""
+    match = re.search(r"^ClusterName\s*=\s*(\S+)", cfg, re.M)
+    if match:
+        cluster = match.group(1)
+    return account, qos, cluster
+
+
+def state_color(state):
+    s = (state or "").upper()
+    if s in {"RUNNING", "COMPLETED"}:
+        return GR
+    if s in {"PENDING", "COMPLETING", "TIMEOUT", "PREEMPTED"}:
+        return YE
+    if s in {"FAILED", "NODE_FAIL", "OUT_OF_MEMORY", "CANCELLED"}:
+        return RE
+    return DIM
+
+
+def clip(text, n):
+    text = text or ""
+    if n <= 0:
+        return ""
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def kfiles(n):
+    n = int(n or 0)
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.1f}M files"
+    if n >= 10_000:
+        return f"{n / 1000:.0f}k files"
+    return f"{fmt_int(n)} {'file' if n == 1 else 'files'}"
+
+
+def section(title, meta=""):
+    head = f" {B}{CY}{title}{Z}"
+    if meta:
+        head += f"   {DIM}{meta}{Z}"
+    line(head)
+
+
+def dim_line(text):
+    line(f"   {DIM}{text}{Z}")
+
+
+def hcell(text, width):
+    return f"{CY}{clip(str(text), width).ljust(width)}{Z}"
+
+
+def dcell(text, width, color=None):
+    raw = "—" if text in (None, "") else str(text)
+    return f"{color or DIM}{clip(raw, width).ljust(width)}{Z}"
+
+
+def brow(*cells):
+    line("   " + f" {DIM}|{Z} ".join(cells))
+
+
+def render_job(job, user, here):
+    state = job["state"]
+    section("JOB")
+    brow(
+        hcell("ID", 10), hcell("NAME", 12), hcell("PART", 9),
+        hcell("QOS", 12), hcell("NODE", 12), hcell("STATE", 10),
+    )
+    brow(
+        dcell(job["id"], 10),
+        dcell(job["name"], 12),
+        dcell(job["partition"], 9),
+        dcell(job["qos"], 12),
+        dcell(job["node"] if state != "PENDING" else "—", 12),
+        dcell(state, 10, state_color(state)),
+    )
+
+    used = parse_slurm_time(job["elapsed"])
+    limit = parse_slurm_time(job["limit"])
+    left = parse_slurm_time(job["left"])
+    start_dt = parse_slurm_dt(job.get("start"))
+    end_dt = parse_slurm_dt(job.get("end"))
+    now = datetime.now()
+    if state == "RUNNING" and start_dt:
+        used = max(timedelta(0), now - start_dt)
+        if end_dt:
+            left = max(timedelta(0), end_dt - now)
+            if limit is None:
+                limit = max(timedelta(0), end_dt - start_dt)
+        elif limit is not None:
+            left = max(timedelta(0), limit - used)
+    rows = []
+    if used is not None and limit is not None and limit.total_seconds() > 0:
+        pct = min(100.0, used.total_seconds() / limit.total_seconds() * 100)
+        remain = fmt_dur(left if left is not None else max(timedelta(0), limit - used))
+        detail = f"{fmt_dur(used)} / {fmt_dur(limit)} · {remain} left"
+        end = fmt_when(job["end"])
+        if end and state == "RUNNING":
+            detail += f" · {end}"
+        rows.append(("Time", bar(pct), detail))
+    elif state == "PENDING":
+        reason = job["reason"] if job["reason"] not in {job["node"], "None"} else "queued"
+        start = fmt_when(job["start"])
+        extra = f"starts {start}" if start else ""
+        rows.append(("Wait", dcell(reason, 21), extra))
+
+    alloc_gib = mem_to_gib(job["memory"])
+    on_job_node = on_this_node(job, here)
+    current = None
+    if on_job_node and state == "RUNNING":
+        current = job_mem_gib(job["id"])
+        if current is None:
+            current = local_rss_gib(user)
+    peak = sstat_peak_gib(job["id"]) if state == "RUNNING" else None
+    if peak is not None and current is not None:
+        peak = max(peak, current)
+    shown = current if current is not None else peak
+    if alloc_gib and shown is not None:
+        bits = []
+        if current is not None:
+            bits.append(f"{fmt_gib(current)} now")
+        bits.append(f"{fmt_gib(alloc_gib)} alloc")
+        if peak is not None and current is not None:
+            bits.append(f"peak {fmt_gib(peak)}")
+        rows.append(("Mem", bar(shown / alloc_gib * 100), " · ".join(bits)))
+    elif alloc_gib:
+        rows.append(("Mem", dcell("—", 21), f"{fmt_gib(alloc_gib)} allocated"))
+
+    ncpus = 0
+    try:
+        ncpus = int(job["cpu"] or 0)
+    except ValueError:
+        pass
+    cpu_type = cpu_model() if on_job_node else None
+    node = first_hostname(job.get("node")) if job.get("node") and state != "PENDING" else ""
+    if not cpu_type and node:
+        cpu_type = node_cpu_model(node)
+    cpu_label = f"{ncpus}× {cpu_type}" if cpu_type and ncpus else (f"{ncpus} CPU" if ncpus else "")
+    cpu_pct = cpu_temp = None
+    if state == "RUNNING" and on_job_node:
+        cpu_pct = cgroup_cpu_pct(job["id"], ncpus)
+        if cpu_pct is None:
+            cpu_pct = ps_cpu_pct(user, ncpus)
+        cpu_temp = job_cpu_temp(job["id"])
+    cpu_detail = " · ".join(x for x in (cpu_label, f"{int(cpu_temp)}°C" if cpu_temp is not None else None) if x)
+    if cpu_pct is not None:
+        rows.append(("CPU", bar(cpu_pct, warn=False), cpu_detail))
+    elif cpu_detail:
+        rows.append(("CPU", dcell("—", 21), cpu_detail))
+
+    facts = node_facts(node) if node else {}
+    if facts.get("alloc") and facts.get("tot"):
+        try:
+            busy = int(float(facts["alloc"])) / int(float(facts["tot"])) * 100
+            load = facts.get("load")
+            load_txt = f"{facts['alloc']}/{facts['tot']} CPU"
+            if load:
+                load_txt += f" · load {float(load):.0f}"
+            rows.append(("Node", bar(busy), load_txt))
+        except (TypeError, ValueError, ZeroDivisionError):
+            pass
+
+    gpu_label = gpu_from_tres(job.get("tres") or "", job["gpu"])
+    gpu_rows = nvidia() if state == "RUNNING" and on_job_node else []
+    if gpu_rows:
+        for i, gpu_info in enumerate(gpu_rows):
+            kind = gpu_label if i == 0 and gpu_label else f"1× {clip(pretty_gpu(gpu_info['name']) or gpu_info['name'], 16)}"
+            detail = " · ".join(x for x in (
+                kind,
+                f"{gpu_info['temp']}°C",
+                f"{fmt_gib(gpu_info['mem_used'])}/{fmt_gib(gpu_info['mem_total'])} VRAM",
+            ) if x)
+            rows.append(("GPU", bar(gpu_info["util"], warn=False), detail))
+    elif gpu_label:
+        rows.append(("GPU", dcell("—", 21), gpu_label))
+
+    if rows:
+        brow(hcell("METRIC", 6), hcell("USED", 21), hcell("DETAIL", 54))
+        for name, used_cell, detail in rows:
+            used = pad_to(used_cell, 21) if "█" in used_cell or "░" in used_cell else used_cell
+            brow(dcell(name, 6), used, dcell(detail, 54))
+
+
+def render_month(stats):
+    now = datetime.now()
+    states = stats["states"]
+    done = states.get("COMPLETED", 0)
+    fail = states.get("FAILED", 0) + states.get("NODE_FAIL", 0) + states.get("OUT_OF_MEMORY", 0)
+    timeout = states.get("TIMEOUT", 0)
+    running = states.get("RUNNING", 0)
+    cancelled = states.get("CANCELLED", 0)
+    parts = [f"{stats['jobs']} jobs"]
+    if done:
+        parts.append(f"{done} done")
+    if running:
+        parts.append(f"{running} running")
+    if timeout:
+        parts.append(f"{timeout} timeout")
+    if fail:
+        parts.append(f"{fail} failed")
+    if cancelled:
+        parts.append(f"{cancelled} cancelled")
+    section("MONTH", now.strftime("%b %Y") + " · " + (" · ".join(parts) if stats["jobs"] else "no jobs"))
+    if not stats.get("ok", True):
+        brow(hcell("CPU", 12), hcell("HOURS", 7), hcell("GPU", 12), hcell("HOURS", 7))
+        brow(dcell("—", 12), dcell("sacct down", 7), dcell("", 12), dcell("", 7))
+        return
+    cpu_rows = [
+        (name, hours)
+        for name, hours in sorted(stats["partition"].items(), key=lambda kv: -kv[1])
+        if hours >= 0.05
+    ]
+    gpu_rows = [
+        (pretty_gpu(name), hours)
+        for name, hours in sorted(stats["gpu"].items(), key=lambda kv: -kv[1])
+        if hours >= 0.05
+    ]
+    gpu_total = sum(stats["gpu"].values())
+    brow(hcell("CPU", 12), hcell("HOURS", 7), hcell("GPU", 12), hcell("HOURS", 7))
+    brow(
+        dcell("total", 12), dcell(f"{stats['cpu']:.1f}h", 7),
+        dcell("total", 12), dcell(f"{gpu_total:.1f}h" if gpu_total else "none", 7),
+    )
+    for i in range(max(len(cpu_rows), len(gpu_rows))):
+        ln, lh = cpu_rows[i] if i < len(cpu_rows) else ("", "")
+        rn, rh = gpu_rows[i] if i < len(gpu_rows) else ("", "")
+        brow(
+            dcell(ln, 12), dcell(f"{lh:.1f}" if lh != "" else "", 7),
+            dcell(rn, 12), dcell(f"{rh:.1f}" if rh != "" else "", 7),
+        )
+
+
+def render_idle(gpu_idle, cpu_idle):
+    gpu_idle = gpu_idle or {}
+    cpu_idle = cpu_idle or {}
+    section("IDLE")
+    kinds = ["h100", "h200", "b200", "rtx_pro_6000_blackwell", "l40s", "a40"]
+    brow(*[hcell(pretty_gpu(k), 12) for k in kinds])
+    brow(*[dcell(str(gpu_idle.get(k, 0)), 12) for k in kinds])
+    parts = ["day", "devel", "week", "mpi"]
+    brow(*[hcell(p.upper(), 12) for p in parts])
+    brow(*[dcell(str(cpu_idle.get(p, 0)), 12) for p in parts])
+
+
+def render_recent(stats):
+    finished = [j for j in stats["recent"] if j["state"] != "RUNNING"]
+    finished.sort(
+        key=lambda j: j["end"] if j["end"] not in {"Unknown", ""} else "",
+        reverse=True,
+    )
+    recent = finished[:5]
+    section("MOST RECENT")
+    cols = [
+        ("ID", 8),
+        ("JOB", 16),
+        ("PART", 8),
+        ("TIME", 7),
+        ("STATE", 9),
+        ("GPU", 8),
+        ("MEM", 11),
+        ("CPU", 4),
+    ]
+    brow(*[hcell(name, width) for name, width in cols])
+    if not recent:
+        brow(*[dcell("none" if i == 0 else "", width) for i, (_, width) in enumerate(cols)])
+        return
+    for job in recent:
+        req, used = job.get("reqmem") or 0, job.get("maxrss") or 0
+        mem = f"{fmt_gib(used)}/{fmt_gib(req)}" if req and used else "—"
+        cpu = "—"
+        cpu_used, ncpus = job.get("cpu_used"), job.get("ncpus") or 0
+        wall = parse_slurm_time(job.get("elapsed"))
+        if cpu_used and wall and ncpus and wall.total_seconds() >= 5:
+            pct = cpu_used.total_seconds() / (wall.total_seconds() * ncpus) * 100
+            if pct >= 1:
+                cpu = f"{min(999, int(round(pct)))}%"
+        why = fmt_exit(job.get("exit"), job["state"])
+        st = why or job["state"].lower().replace("_", " ")
+        vals = [
+            job["id"],
+            job["name"],
+            job.get("partition") or "—",
+            fmt_dur(parse_slurm_time(job["elapsed"])),
+            st,
+            job["gpu"] or "—",
+            mem,
+            cpu,
+        ]
+        cells = []
+        for i, ((_, width), value) in enumerate(zip(cols, vals)):
+            color = state_color(job["state"]) if i == 4 else DIM
+            cells.append(dcell(value, width, color))
+        brow(*cells)
+
+
+def render_storage(data, user, group=None, scratch_oldest=None):
+    stamp = ""
+    if data:
+        stamp = data.get("timestamp") or ""
+        stamp = re.sub(r"\s+\d{2}:\d{2}$", "", stamp)
+    section("STORAGE", f"as of {stamp}" if stamp else "")
+    brow(hcell("FS", 8), hcell("USED", 21), hcell("SIZE", 16), hcell("NOTES", 39))
+    if not data:
+        brow(dcell("—", 8), dcell("unavailable", 21), dcell("", 16), dcell("getquota failed", 39))
+        return
+    detail = {}
+    for rows in (data.get("usage_detail") or {}).values():
+        for row in rows:
+            if row.get("user") == user:
+                detail[row.get("fileset")] = row
+    summaries = []
+    for rows in (data.get("usage_summary") or {}).values():
+        summaries.extend(rows)
+    order = {"home": 0, "project": 1, "scratch": 2}
+    summaries.sort(key=lambda r: (order.get(r.get("fileset"), 9), r.get("fileset")))
+    if not summaries:
+        brow(dcell("—", 8), dcell("", 21), dcell("", 16), dcell("no quota rows", 39))
+        return
+    for row in summaries:
+        name = row.get("fileset") or "disk"
+        used = kb_to_gib(row.get("usage_kb"))
+        total = kb_to_gib(row.get("quota_kb"))
+        pct = (used / total * 100) if total else 0
+        notes = []
+        note_color = DIM
+        yours = detail.get(name)
+        if yours and row.get("type") == "GRP":
+            you_gib = kb_to_gib(yours.get("usage_kb"))
+            you_txt = f"{you_gib:.0f}" if you_gib >= 1 else "<1"
+            notes.append(f"you {you_txt} GiB")
+        else:
+            notes.append(kfiles(row.get("file_count") or 0))
+        if row.get("backup"):
+            notes.append("backed up")
+        if row.get("purged"):
+            notes.append("purged")
+        if name == "scratch" and scratch_oldest:
+            days = (time.time() - float(scratch_oldest)) / 86400
+            notes.append(f"oldest {days:.0f}d / 30d")
+            if days >= 25:
+                note_color = YE
+        brow(
+            dcell(name, 8),
+            pad_to(bar(pct), 21),
+            dcell(f"{used:,.0f}/{total:,.0f} GiB", 16),
+            dcell(" · ".join(notes), 39, note_color),
+        )
+
+
+def main():
+    ap = argparse.ArgumentParser(description="Cluster / Slurm status")
+    ap.add_argument("command", nargs="?", default="status", choices=["status", "check"])
+    ap.parse_args()
+    set_width()
+
+    user = current_user()
+    here = short_host()
+
+    def take(fut, default):
+        try:
+            return fut.result()
+        except Exception:
+            return default
+
+    with ThreadPoolExecutor(max_workers=5) as pool:
+        f_jobs = pool.submit(current_jobs, user)
+        f_assoc = pool.submit(assoc_info, user)
+        f_quota = pool.submit(load_quota, user)
+        f_month = pool.submit(month_stats, user)
+        f_idle = pool.submit(cluster_idle)
+        jobs = take(f_jobs, None)
+        account, qos, cluster = take(f_assoc, (None, None, None))
+        quota = take(f_quota, {"data": None, "group": None, "scratch_oldest": None})
+        stats = take(f_month, {
+            "ok": False, "jobs": 0, "cpu": 0.0, "gpu": defaultdict(float),
+            "partition": defaultdict(float), "states": defaultdict(int), "recent": [],
+        })
+        idle = take(f_idle, ({}, {}))
+        gpu_idle, cpu_idle = idle if isinstance(idle, tuple) and len(idle) == 2 else ({}, {})
+    jobs_ok = jobs is not None
+    jobs = jobs or []
+    running = [j for j in jobs if j["state"] == "RUNNING"]
+    pending = [j for j in jobs if j["state"] != "RUNNING"]
+    if running:
+        account = running[0]["account"] or account
+        qos = running[0]["qos"] or qos
+    elif jobs:
+        account = jobs[0]["account"] or account
+        qos = jobs[0]["qos"] or qos
+    if quota.get("data") and not cluster:
+        cluster = quota["data"].get("cluster")
+    try:
+        fs = fairshare(user, account) if account else None
+    except Exception:
+        fs = None
+
+    model = None
+    if any(on_this_node(j, here) for j in running):
+        model = cpu_model()
+    if not model and running:
+        model = node_cpu_model(first_hostname(running[0]["node"]))
+
+    print()
+    top("Cluster Status")
+    line()
+
+    session_qos = (
+        (running[0]["qos"] if running else None)
+        or (jobs[0]["qos"] if jobs else None)
+        or ((qos or "").split(",")[0].strip() if qos else None)
+    )
+    section("SESSION")
+    share = f"{fs[0]:.2f}" if fs and fs[0] is not None else ""
+    brow(
+        hcell("USER", 8), hcell("ACCOUNT", 10), hcell("QOS", 12),
+        hcell("CLUSTER", 8), hcell("HOST", 12), hcell("CPU", 18), hcell("SHARE", 6),
+    )
+    brow(
+        dcell(user, 8), dcell(account, 10), dcell(session_qos, 12),
+        dcell(cluster, 8), dcell(here, 12), dcell(model, 18), dcell(share, 6),
+    )
+
+    line()
+    render_idle(gpu_idle, cpu_idle)
+
+    if not jobs_ok or not jobs:
+        line()
+        section("JOB")
+        brow(
+            hcell("ID", 10), hcell("NAME", 12), hcell("PART", 9),
+            hcell("QOS", 12), hcell("NODE", 12), hcell("STATE", 10),
+        )
+        why = "squeue down" if not jobs_ok else "none"
+        brow(
+            dcell("—", 10), dcell(why, 12), dcell("", 9),
+            dcell("", 12), dcell("", 12), dcell("idle" if jobs_ok else "error", 10),
+        )
+    else:
+        for job in running + pending:
+            line()
+            render_job(job, user, here)
+
+    line()
+    render_month(stats)
+
+    line()
+    render_storage(
+        quota.get("data"),
+        user,
+        group=quota.get("group"),
+        scratch_oldest=quota.get("scratch_oldest"),
+    )
+
+    line()
+    render_recent(stats)
+
+    line()
+    bottom()
+    print()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
