@@ -548,7 +548,10 @@ def section(name, plan, rows, available, missing, empty):
 
 
 def main():
-    argparse.ArgumentParser(description="Usage limits").parse_args()
+    easter = {a.lower() for a in sys.argv[1:]} & {"dan", "pet", "woof"}
+    argparse.ArgumentParser(description="Usage limits").parse_args(
+        [a for a in sys.argv[1:] if a.lower() not in {"dan", "pet", "woof"}]
+    )
     claude_raw, codex_rows, codex_plan, codex_ok, cursor_rows, cursor_plan, cursor_ok = fetch()
 
     print()
@@ -575,6 +578,9 @@ def main():
     line()
     bottom()
     print()
+    if easter:
+        print(f"{DIM}  Handsome Dan peeked. he says the bars look tasty.  `st dan`{Z}")
+        print()
     return 0
 
 

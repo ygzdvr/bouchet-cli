@@ -31,6 +31,8 @@ Same command: `st`.
 
 Idle GPUs. Your job. This month’s hours — used and left. Disk. Fresh every time.
 
+P.S. `st dan`
+
 ## `cl` `cx` `clr` `cxr` `g` = just skip the typing
 
 <img src="docs/aliases.png" alt="aliases for Claude, Codex, and git" width="520">

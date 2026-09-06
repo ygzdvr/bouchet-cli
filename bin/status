@@ -1456,10 +1456,170 @@ def render_storage(data, user, group=None, scratch_oldest=None):
         )
 
 
+def hottest_disk(data):
+    best = None
+    for rows in ((data or {}).get("usage_summary") or {}).values():
+        for row in rows:
+            used = kb_to_gib(row.get("usage_kb"))
+            total = kb_to_gib(row.get("quota_kb"))
+            if not total:
+                continue
+            pct = used / total * 100
+            name = row.get("fileset") or "disk"
+            if best is None or pct > best[1]:
+                best = (name, pct)
+    return best
+
+
+def lucky_gpu(gpu_idle):
+    gpu_idle = gpu_idle or {}
+    order = ["h100", "h200", "b200", "rtx_pro_6000_blackwell", "l40s", "a40"]
+    best = None
+    for kind in order:
+        n = int(gpu_idle.get(kind) or 0)
+        if best is None or n > best[1]:
+            best = (kind, n)
+    return best
+
+
+def dan_path():
+    return os.path.join(os.path.expanduser("~"), ".cache", "bouchet-cli", "dan.json")
+
+
+def dan_load():
+    try:
+        with open(dan_path()) as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return {"treats": 0, "seen": None}
+
+
+def dan_save(data):
+    path = dan_path()
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump(data, f)
+    except OSError:
+        pass
+
+
+def dan_mood(gpu_idle, running, pending, disk, hour, feeding):
+    if feeding:
+        return "loved"
+    if disk and disk[1] >= 95:
+        return "stuffed"
+    if pending:
+        return "waiting"
+    if running:
+        return "working"
+    if hour < 6 or hour >= 23:
+        return "sleepy"
+    h100 = int((gpu_idle or {}).get("h100") or 0)
+    if h100 >= 8:
+        return "zoomies"
+    return "good"
+
+
+def render_dan(gpu_idle, running, pending, disk, fs, feeding=False):
+    """Yale's Handsome Dan. Hidden pet. Try: st dan · st treat"""
+    state = dan_load()
+    now = datetime.now()
+    last = state.get("seen")
+    missed = 0
+    if last:
+        try:
+            missed = max(0, (now - datetime.fromisoformat(last)).days)
+        except (TypeError, ValueError):
+            missed = 0
+    if feeding:
+        state["treats"] = int(state.get("treats") or 0) + 1
+    state["seen"] = now.isoformat(timespec="seconds")
+    dan_save(state)
+    treats = int(state.get("treats") or 0)
+    hour = now.hour
+    mood = dan_mood(gpu_idle, running, pending, disk, hour, feeding)
+    faces = {
+        "zoomies": ("▲", "▲", "▾"),
+        "working": ("•", "•", "▾"),
+        "stuffed": ("▲", "▲", "O"),
+        "waiting": ("•", "•", "‿"),
+        "sleepy": ("-", "-", "ω"),
+        "loved": ("*", "*", "▽"),
+        "good": ("▲", "▲", "▾"),
+    }
+    le, reye, mouth = faces.get(mood, faces["good"])
+    luck = lucky_gpu(gpu_idle)
+    luck_txt = f"{pretty_gpu(luck[0])} × {luck[1]} idle" if luck else "the yard is empty"
+    lines_art = [
+        "            ∩───────∩",
+        f"          /  {le}     {reye}  \\",
+        f"         |        {mouth}      |",
+        "          \\    ──ω──    /",
+        "           \\___________/",
+    ]
+    quotes = {
+        "zoomies": "H100s are in the yard. go get one.",
+        "working": "you're on a node. I am proud. I will nap on the job script.",
+        "stuffed": f"{disk[0]} is {disk[1]:.0f}% full. I sat on the trash can. it did not help.",
+        "waiting": "queue. I sit. I wait. I believe in you.",
+        "sleepy": f"it is {now.strftime('%I:%M %p').lstrip('0')}. sleep is a checkpoint.",
+        "loved": "WOOF. treat accepted. I will not share with the scheduler.",
+        "good": "we live another day. fairshare is a feeling.",
+    }
+    if missed >= 2 and not feeding:
+        quotes[mood] = f"you were gone {missed} days. I guarded the login node."
+    print()
+    top("Handsome Dan")
+    line()
+    line(f"  {B}{CY}Yale's goodest boy{Z}   {DIM}{mood}{Z}")
+    line()
+    for art in lines_art:
+        line(art)
+    line()
+    line(f"   {quotes.get(mood, quotes['good'])}")
+    line()
+    line(f"   {DIM}lucky GPU · {luck_txt}{Z}")
+    line(f"   {DIM}treats · {treats}   `st treat` to feed me{Z}")
+    if running:
+        names = ", ".join((j.get("name") or "?") for j in running[:3])
+        line(f"   {DIM}watching · {names}{Z}")
+    if fs and fs[0] is not None:
+        line(f"   {DIM}fairshare · {fs[0]:.2f}{Z}")
+    line()
+    bottom()
+    print()
+    print(f"{DIM}psst · `st dan` anytime. I live in ~/.cache/bouchet-cli/{Z}")
+    print()
+    return 0
+
+
+def status_bark(gpu_idle, disk, running, pending, hour):
+    """Rare one-liner on the real dashboard. Dan whispering."""
+    if disk and disk[1] >= 95:
+        return f"project is {disk[1]:.0f}% — Dan is sitting on the trash can"
+    if pending and not running:
+        return "Dan is in the queue with you. he brought a ball."
+    if hour < 5:
+        return "it's late. checkpoint. Dan already did."
+    h100 = int((gpu_idle or {}).get("h100") or 0)
+    if h100 >= 15 and not running:
+        return f"{h100} H100s idle. Dan says fetch."
+    if datetime.now().day == 13:
+        return "unlucky day. extra luck: `st dan`"
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description="Cluster / Slurm status")
-    ap.add_argument("command", nargs="?", default="status", choices=["status", "check"])
-    ap.parse_args()
+    ap.add_argument("command", nargs="?", default="status")
+    args = ap.parse_args()
+    cmd = (args.command or "status").lower().strip()
+    feeding = cmd in {"treat", "snack"}
+    see_dan = feeding or cmd in {"dan", "pet", "handsome", "woof", "dog"}
     set_width()
 
     user = current_user()
@@ -1510,6 +1670,10 @@ def main():
         model = cpu_model()
     if not model and running:
         model = node_cpu_model(first_hostname(running[0]["node"]))
+
+    if see_dan:
+        disk = hottest_disk((quota or {}).get("data"))
+        return render_dan(gpu_idle, running, pending, disk, fs, feeding=feeding)
 
     print()
     top("Cluster Status")
@@ -1564,6 +1728,17 @@ def main():
 
     line()
     render_recent(stats)
+
+    bark = status_bark(
+        gpu_idle,
+        hottest_disk((quota or {}).get("data")),
+        running,
+        pending,
+        datetime.now().hour,
+    )
+    if bark:
+        line()
+        line(f"  {DIM}{bark}{Z}")
 
     line()
     bottom()
