@@ -1,26 +1,33 @@
-# lm-status
+# bouchet-cli
 
-Two terminal dashboards for Yale HPC (Bouchet, Grace, McCleary) and anywhere else Slurm + Claude/Codex live.
+CLI tools and aliases for Yale HPC (Bouchet, Grace, McCleary).
 
-| Alias | What it shows |
+| Alias | What it does |
 |---|---|
-| `lm` / `limits` | Claude and Codex usage bars (session + week). Live every run. |
-| `status` / `st` | Slurm session, idle GPUs, your jobs, monthly allocation, storage, most recent jobs. |
+| `g` | `git` |
+| `cl` | Claude Code, skip permissions |
+| `cx` | Codex CLI, `--yolo` |
+| `clr` | Claude Code, skip permissions, resume last session |
+| `cxr` | Codex CLI, `--yolo`, resume last session |
+| `lm` / `limits` | Claude and Codex usage bars (session + week) |
+| `status` / `st` | Slurm session, idle GPUs, your jobs, monthly allocation, storage |
 
 No extra Python packages. Needs `python3` (already on YCRC clusters).
 
 ## Install (one line)
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/ygzdvr/lm-status/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/ygzdvr/bouchet-cli/main/install.sh | bash
+source ~/.bashrc
 ```
 
-Then reload once and use any of the four aliases:
+Then:
 
 ```bash
-source ~/.bashrc
 lm          # or: limits
 status      # or: st
+cl          # Claude
+cx          # Codex
 ```
 
 `~/.local/bin` is already on `PATH` for most Yale accounts. If `lm` or `status` is not found:
@@ -33,12 +40,12 @@ source ~/.bashrc
 ### From a clone
 
 ```bash
-git clone https://github.com/ygzdvr/lm-status.git
-cd lm-status
+git clone https://github.com/ygzdvr/bouchet-cli.git
+cd bouchet-cli
 ./install.sh
 ```
 
-## `lm` — AI usage
+## `lm` / `limits` — AI usage
 
 Requires at least one of these on `PATH`:
 
@@ -47,7 +54,7 @@ Requires at least one of these on `PATH`:
 
 Logged-out or missing tools are skipped. Token counts and email are never printed.
 
-## `status` — cluster dashboard
+## `status` / `st` — cluster dashboard
 
 Meant for **YCRC Slurm** (Bouchet / Grace / McCleary). Needs:
 
@@ -61,7 +68,7 @@ GPU rows cover the usual Yale types (H100, H200, B200, RTX PRO 6000, L40S, A40).
 
 ```bash
 rm -f ~/.local/bin/lm ~/.local/bin/status
-# then delete the "# --- lm-status aliases ---" block from ~/.aliases.sh or ~/.bashrc
+# then delete the "# --- bouchet-cli aliases ---" block from ~/.aliases.sh or ~/.bashrc
 ```
 
 ## License
